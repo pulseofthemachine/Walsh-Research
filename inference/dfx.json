@@ -1,0 +1,21 @@
+{
+    "canisters": {
+        "spinnet_backend": {
+            "type": "rust",
+            "candid": "src/spinnet_backend.did",
+            "package": "spinnet-inference"
+        },
+        "spinnet_frontend": {
+            "type": "assets",
+            "source": [
+                "frontend"
+            ]
+        }
+    },
+    "defaults": {
+        "build": {
+            "packtool": ""
+        }
+    },
+    "version": 1
+}

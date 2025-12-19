@@ -1,0 +1,26 @@
+service : {
+    // Full generation (fast path)
+    generate_full : (text, nat32) -> (text);
+    
+    // Layer-by-layer chunked generation
+    start_generation : (text, nat32) -> (text);
+    start_forward : () -> (text);
+    process_layers : (nat32) -> (text);
+    finish_forward : () -> (text);
+    "generate_next_token": () -> (text);
+    "start_session": (nat32, text, nat32) -> (text);
+    "generate_batch": (vec nat32) -> (vec text);
+    "start_forward_session": (nat32) -> (text);
+    "process_layers_session": (nat32, nat32) -> (text);
+    "finish_forward_session": (nat32) -> (text);
+    
+    // Status and results
+    get_result : () -> (text) query;
+    generation_status : () -> (text) query;
+    
+    // Fast embedding-only
+    generate_quick : (text) -> (text) query;
+    
+    // Config
+    get_config : () -> (text) query;
+}

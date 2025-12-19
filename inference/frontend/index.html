@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SpinNet Inference</title>
+    <style>
+        :root {
+            --bg: #0a0a0f;
+            --surface: #13131a;
+            --accent: #6366f1;
+            --accent-glow: rgba(99, 102, 241, 0.3);
+            --text: #e2e8f0;
+            --text-dim: #94a3b8;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #6366f1 0%, #a855f7 100%);
+            background-clip: text;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+
+        .subtitle {
+            color: var(--text-dim);
+            margin-bottom: 2rem;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 700px;
+            background: var(--surface);
+            border-radius: 16px;
+            padding: 2rem;
+            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+        }
+
+        .input-group {
+            margin-bottom: 1.5rem;
+        }
+
+        label {
+            display: block;
+            color: var(--text-dim);
+            margin-bottom: 0.5rem;
+            font-size: 0.9rem;
+        }
+
+        textarea {
+            width: 100%;
+            height: 120px;
+            background: var(--bg);
+            border: 1px solid #2a2a3a;
+            border-radius: 8px;
+            padding: 1rem;
+            color: var(--text);
+            font-family: 'Fira Code', monospace;
+            font-size: 0.95rem;
+            resize: vertical;
+            transition: border-color 0.2s;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+
+        .btn {
+            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+            color: white;
+            border: none;
+            padding: 0.875rem 2rem;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.15s, box-shadow 0.15s;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 16px var(--accent-glow);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .output {
+            margin-top: 2rem;
+            padding: 1.5rem;
+            background: var(--bg);
+            border-radius: 8px;
+            border: 1px solid #2a2a3a;
+            min-height: 150px;
+            font-family: 'Fira Code', monospace;
+            white-space: pre-wrap;
+            line-height: 1.6;
+        }
+
+        .status {
+            margin-top: 1rem;
+            padding: 0.75rem;
+            border-radius: 6px;
+            font-size: 0.85rem;
+        }
+
+        .status.loading {
+            background: rgba(99, 102, 241, 0.1);
+            color: #818cf8;
+        }
+
+        .status.error {
+            background: rgba(239, 68, 68, 0.1);
+            color: #f87171;
+        }
+
+        .status.success {
+            background: rgba(34, 197, 94, 0.1);
+            color: #4ade80;
+        }
+
+        .config {
+            margin-top: 1rem;
+            font-size: 0.8rem;
+            color: var(--text-dim);
+        }
+    </style>
+</head>
+
+<body>
+    <h1>SpinNet</h1>
+    <p class="subtitle">Ternary-Octonion Language Model on Internet Computer</p>
+
+    <div class="container">
+        <div class="input-group">
+            <label for="prompt">Prompt</label>
+            <textarea id="prompt" placeholder="Enter your prompt here...">ROMEO:
+</textarea>
+        </div>
+
+        <button class="btn" id="generateBtn" onclick="generate()">Generate</button>
+
+        <div id="status" class="status" style="display: none;"></div>
+
+        <div class="output" id="output">
+            <span style="color: var(--text-dim);">Output will appear here...</span>
+        </div>
+
+        <div class="config" id="config">Loading config...</div>
+    </div>
+
+    <script type="module">
+        // IC canister ID (set after deployment)
+        const CANISTER_ID = "u6s2n-gx777-77774-qaaba-cai";
+
+        // Simple Candid decoder for text responses
+        function decodeTextResponse(buffer) {
+            const view = new DataView(buffer);
+            // Skip DIDL header (simplified)
+            let offset = 0;
+
+            // Look for text content after header bytes
+            const bytes = new Uint8Array(buffer);
+
+            // Find start of actual text (skip candid encoding)
+            // Text is usually after the length prefix
+            for (let i = 0; i < bytes.length - 4; i++) {
+                if (bytes[i] < 128 && bytes[i] > 31) {
+                    // Found printable ASCII, try to decode from here
+                    const textBytes = bytes.slice(i);
+                    try {
+                        const decoder = new TextDecoder('utf-8', { fatal: false });
+                        let text = decoder.decode(textBytes);
+                        // Clean up any binary prefix
+                        const cleanStart = text.search(/[A-Za-z0-9\n ]/);
+                        if (cleanStart > 0) {
+                            text = text.substring(cleanStart);
+                        }
+                        return text.replace(/\0/g, '');
+                    } catch (e) {
+                        continue;
+                    }
+                }
+            }
+            return "Unable to decode response";
+        }
+
+        // Call canister using raw HTTP
+        async function callCanister(method, arg = null) {
+            const url = `http://127.0.0.1:4943/api/v2/canister/${CANISTER_ID}/query`;
+
+            // Simple Candid encoding for text argument
+            let body;
+            if (arg !== null) {
+                // Encode as Candid text: DIDL + type table + text length + text
+                const textBytes = new TextEncoder().encode(arg);
+                const candid = new Uint8Array(4 + 1 + 1 + textBytes.length);
+                candid[0] = 0x44; // D
+                candid[1] = 0x49; // I
+                candid[2] = 0x44; // D
+                candid[3] = 0x4C; // L
+                candid[4] = 0x00; // Empty type table
+                candid[5] = textBytes.length; // Text length (simple LEB128 for small strings)
+                candid.set(textBytes, 6);
+
+                body = JSON.stringify({
+                    content: {
+                        request_type: "query",
+                        canister_id: CANISTER_ID,
+                        method_name: method,
+                        arg: Array.from(candid),
+                        sender: "2vxsx-fae"  // Anonymous
+                    }
+                });
+            }
+
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/cbor'
+                },
+                body: body || '{}'
+            });
+
+            return response;
+        }
+
+        // Generate using dfx CLI fallback (works!)
+        window.generate = async function () {
+            const btn = document.getElementById('generateBtn');
+            const status = document.getElementById('status');
+            const output = document.getElementById('output');
+            const prompt = document.getElementById('prompt').value;
+
+            btn.disabled = true;
+            status.style.display = 'block';
+            status.className = 'status loading';
+            status.textContent = 'Generating...';
+
+            try {
+                // For demo, show the prompt and indicate generation
+                output.innerHTML = `<span style="color: #818cf8;">${prompt}</span><span class="cursor">|</span>`;
+
+                // We can't call IC directly from browser without agent-js
+                // For now, show instructions
+                status.className = 'status success';
+                status.innerHTML = `
+                    To generate text, run in terminal:<br>
+                    <code style="background:#1a1a2e;padding:4px 8px;border-radius:4px;">
+                    dfx canister call spinnet_backend generate '("${prompt.replace(/"/g, '\\"').replace(/\n/g, '\\n')}")'
+                    </code>
+                `;
+
+                output.innerHTML = `<span style="color: var(--text-dim);">
+Run the command above in your terminal to generate text.
+
+The canister is running and ready! The browser frontend requires 
+the @dfinity/agent library for direct calls, which we haven't 
+bundled yet.
+
+Quick test:
+  dfx canister call spinnet_backend get_config
+  dfx canister call spinnet_backend generate '("Hello")'
+                </span>`;
+
+            } catch (error) {
+                status.className = 'status error';
+                status.textContent = `Error: ${error.message}`;
+            } finally {
+                btn.disabled = false;
+            }
+        };
+
+        // Load config on page load
+        async function loadConfig() {
+            const configEl = document.getElementById('config');
+            configEl.textContent = `Canister: ${CANISTER_ID} | Model: SpinNet (Ternary-Octonion)`;
+        }
+
+        loadConfig();
+    </script>
+</body>
+
+</html>

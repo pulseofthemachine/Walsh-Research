@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Models and Checkpoints
+*.pt
+*.pth
+*.ckpt
+*.spinnet
+experiments/
+out/
+ckpt_v2.spinnet
+
+# Datasets (Keep scripts, ignore binaries)
+data/**/*.bin
+!data/tinyshakespeare/prepare.py
+!data/crypto/prepare.py
+!data/fineweb/prepare.py
+
+# Rust / DFINITY
+target/
+.dfx/
+inference/target/
+inference/.dfx/
+inference/Cargo.lock
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+runs/
