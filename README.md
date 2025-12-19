@@ -56,13 +56,14 @@ A bare-metal inference engine designed for the **DFINITY Internet Computer (IC)*
 - **Weights**: Parses custom `.spinnet` sparse-ternary format.
 - **Execution**: Splits the Forward pass into chunks to fit in a single block.
 - **KV Cache**: Implemented incremental attention (O(1) complexity).
-- **Batched Inference**: Using inverted loops and `BTreeMap` session management, we achieve **1.51 tok/sec** aggregate throughput (3x boost) for concurrent users.
+- **Storage Optimization**: Hybrid **Bitmask Format** (v4) reduces model size by **14%** (0.32 MB vs 0.37 MB) compared to v2 while enabling sparse iteration (skipping zero weights).
+- **Single-User Speedup**: Implemented `generate_n_tokens` to generate ~50 tokens in a single update call, achieving **4.76 tok/sec** (9x speedup) for interactive sessions.
 
 **Usage (IC Replica)**:
 ```bash
 cd inference
 dfx deploy
-./run_batch_inference.sh
+./verify_single_user.sh
 ```
 
 ---
@@ -72,7 +73,6 @@ dfx deploy
 We have verified **mechanical correctness** across the stack.
 - The Python model trains and reduces loss.
 - The Rust engine produces mathematically identical outputs to the Python reference.
-- The Batched Engine handles concurrent sessions correctly.
 
 **However**, the current checkpoint (`ckpt_v2.spinnet`) is trained on a tiny dataset (TinyShakespeare) for a very short time.
 - **Expected Output**: "To be or not to be..."
@@ -89,10 +89,10 @@ We have verified **mechanical correctness** across the stack.
 - [x] Write Fused Triton Kernels
 - [x] Port inference to Rust/Wasm
 - [x] Implement KV Cache & Flash Attention equivalent
-- [x] Implement Batched Inference (Session Manager)
+- [x] Implement generate_n_tokens to generate ~50 tokens in a single update call
 
 ### Phase 2: Deployment & UX (🚧 In Progress)
-- [ ] **Client-Side Wasm**: Port the Rust engine to run directly in the browser (via `wasm-bindgen`). This eliminates network latency.
+- [ ] **Client-Side Wasm**: Port the Rust engine to run directly in the browser (via `wasm-bindgen`) for use with larger models that would be too slow to run on the IC, respecting current instruction limits.
 - [ ] **Web Dashboard**: Visualizer for the hyper-dimensional states.
 - [ ] **Data Quality**: Train a 100M+ param model on FineWeb-Edu to produce coherent English.
 - [.] **Mainnet**: Deploy the canister to the live IC network.

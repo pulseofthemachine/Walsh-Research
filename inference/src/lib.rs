@@ -1,6 +1,6 @@
-//! SpinNet Inference Engine for Internet Computer
+//! SpinNet Inference Engine for Internet Computer (Single-User Mode)
 //!
-//! Implements layer-by-layer chunked execution to work within IC instruction limits.
+//! Implements layer-by-layer chunked execution with singleton state.
 
 mod model;
 mod octonion;
@@ -9,7 +9,6 @@ mod attention;
 use candid::{CandidType, Deserialize};
 use ic_cdk_macros::{init, post_upgrade, query, update};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 
 use model::{SpinNetModel, KVCache};
 
@@ -43,9 +42,9 @@ enum ForwardPhase {
 
 thread_local! {
     static MODEL: RefCell<Option<SpinNetModel>> = RefCell::new(None);
-    // Map from SessionID (u32) to State
-    static GEN_STATES: RefCell<BTreeMap<u32, GenerationState>> = RefCell::new(BTreeMap::new());
-    static FWD_STATES: RefCell<BTreeMap<u32, ForwardState>> = RefCell::new(BTreeMap::new());
+    // Single-user state (Singleton)
+    static GEN_STATE: RefCell<Option<GenerationState>> = RefCell::new(None);
+    static FWD_STATE: RefCell<Option<ForwardState>> = RefCell::new(None);
 }
 
 #[init]
@@ -84,7 +83,7 @@ fn generate_full(prompt: String, max_tokens: u32) -> String {
     })
 }
 
-/// Start generating with layer-by-layer execution
+/// Start generating with layer-by-layer execution (resets state)
 #[update]
 fn start_generation(prompt: String, max_tokens: u32) -> String {
     MODEL.with(|m| {
@@ -93,13 +92,13 @@ fn start_generation(prompt: String, max_tokens: u32) -> String {
             Some(model) => {
                 let tokens = model.tokenize(&prompt);
                 
-                // Clear any existing forward state for session 0
-                FWD_STATES.with(|fwd| {
-                    fwd.borrow_mut().remove(&0);
+                // Clear any existing forward state
+                FWD_STATE.with(|fwd| {
+                    *fwd.borrow_mut() = None;
                 });
                 
-                GEN_STATES.with(|s| {
-                    s.borrow_mut().insert(0, GenerationState {
+                GEN_STATE.with(|s| {
+                    *s.borrow_mut() = Some(GenerationState {
                         tokens,
                         max_tokens: max_tokens as usize,
                         generated_count: 0,
@@ -122,15 +121,16 @@ fn start_forward() -> String {
         let model_ref = m.borrow();
         match model_ref.as_ref() {
             Some(model) => {
-                GEN_STATES.with(|gen| {
+                GEN_STATE.with(|gen| {
                     let gen_ref = gen.borrow();
-                    match gen_ref.get(&0) {
+                    match gen_ref.as_ref() {
                         Some(gen_state) => {
-                            FWD_STATES.with(|fwd| {
+                            FWD_STATE.with(|fwd| {
                                 let mut fwd_ref = fwd.borrow_mut();
                                 
-                                // Check if we have an existing cache
-                                let existing_cache = fwd_ref.get_mut(&0).and_then(|s| s.kv_cache.take());
+                                // Check if we have an existing cache in the *previous* state
+                                // We extract it to reuse it
+                                let existing_cache = fwd_ref.as_mut().and_then(|s| s.kv_cache.take());
                                 
                                 if let Some(mut cache) = existing_cache {
                                     // Continuation: only embed the NEW token (last one)
@@ -138,7 +138,7 @@ fn start_forward() -> String {
                                     let hidden = model.embed_tokens(&[new_token]);
                                     let seq_len = gen_state.tokens.len();
                                     
-                                    fwd_ref.insert(0, ForwardState {
+                                    *fwd_ref = Some(ForwardState {
                                         hidden,
                                         layer_idx: 0,
                                         seq_len,
@@ -154,7 +154,7 @@ fn start_forward() -> String {
                                     let seq_len = gen_state.tokens.len();
                                     let cache = KVCache::new(model.config.n_layer);
                                     
-                                    fwd_ref.insert(0, ForwardState {
+                                    *fwd_ref = Some(ForwardState {
                                         hidden,
                                         layer_idx: 0,
                                         seq_len,
@@ -184,9 +184,9 @@ fn process_layers(count: u32) -> String {
         let model_ref = m.borrow();
         match model_ref.as_ref() {
             Some(model) => {
-                FWD_STATES.with(|fwd| {
+                FWD_STATE.with(|fwd| {
                     let mut fwd_ref = fwd.borrow_mut();
-                    match fwd_ref.get_mut(&0) {
+                    match fwd_ref.as_mut() {
                         Some(state) => {
                             if state.phase != ForwardPhase::Layers {
                                 return format!("Not in layer phase (phase: {:?})", state.phase);
@@ -220,7 +220,7 @@ fn process_layers(count: u32) -> String {
                                     state.phase = ForwardPhase::FinalNorm;
                                 }
                             } else {
-                                // Fallback: non-cached execution (shouldn't happen normally)
+                                // Fallback: non-cached (shouldn't happen normally)
                                 for _ in 0..count {
                                     if state.layer_idx >= model.config.n_layer {
                                         state.phase = ForwardPhase::FinalNorm;
@@ -253,150 +253,6 @@ fn process_layers(count: u32) -> String {
     result
 }
 
-/// Start forward pass for a specific session
-#[update]
-fn start_forward_session(session_id: u32) -> String {
-    let result = MODEL.with(|m| {
-        let model_ref = m.borrow();
-        match model_ref.as_ref() {
-            Some(model) => {
-                GEN_STATES.with(|gen| {
-                    let gen_ref = gen.borrow();
-                    match gen_ref.get(&session_id) {
-                        Some(gen_state) => {
-                            FWD_STATES.with(|fwd| {
-                                let mut fwd_ref = fwd.borrow_mut();
-                                
-                                // Always start fresh for prompt processing in batched mode setup
-                                // Assume previous cache is invalid/cleared by start_session
-                                
-                                let hidden = model.embed_tokens(&gen_state.tokens);
-                                let seq_len = gen_state.tokens.len();
-                                let cache = KVCache::new(model.config.n_layer);
-                                
-                                fwd_ref.insert(session_id, ForwardState {
-                                    hidden,
-                                    layer_idx: 0,
-                                    seq_len,
-                                    new_len: seq_len,  // All tokens act as new for prompt
-                                    phase: ForwardPhase::Layers,
-                                    kv_cache: Some(cache),
-                                });
-                                
-                                format!("Session {}: Forward initialized", session_id)
-                            })
-                        }
-                        None => format!("Error: No generation state for session {}", session_id),
-                    }
-                })
-            }
-            None => "Error: No model".to_string(),
-        }
-    });
-    result
-}
-
-/// Process multiple transformer layers for a specific session
-#[update]
-fn process_layers_session(session_id: u32, count: u32) -> String {
-    let result = MODEL.with(|m| {
-        let model_ref = m.borrow();
-        match model_ref.as_ref() {
-            Some(model) => {
-                FWD_STATES.with(|fwd| {
-                    let mut fwd_ref = fwd.borrow_mut();
-                    match fwd_ref.get_mut(&session_id) {
-                        Some(state) => {
-                            if state.phase != ForwardPhase::Layers {
-                                return format!("Not in layer phase (phase: {:?})", state.phase);
-                            }
-                            
-                            let mut processed = 0;
-                            
-                            // Use cached execution if we have a cache
-                            if let Some(ref mut cache) = state.kv_cache {
-                                for _ in 0..count {
-                                    if state.layer_idx >= model.config.n_layer {
-                                        state.phase = ForwardPhase::FinalNorm;
-                                        break;
-                                    }
-                                    
-                                    // Process layer with cache
-                                    let new_hidden = model.run_layer_cached(
-                                        state.layer_idx,
-                                        &state.hidden,
-                                        state.new_len,
-                                        cache,
-                                    );
-                                    state.hidden = new_hidden;
-                                    state.layer_idx += 1;
-                                    processed += 1;
-                                }
-                                
-                                // After all layers, update cached length
-                                if state.layer_idx >= model.config.n_layer {
-                                    cache.update_len(state.new_len);
-                                    state.phase = ForwardPhase::FinalNorm;
-                                }
-                            }
-                            
-                            if state.phase == ForwardPhase::FinalNorm {
-                                "Done".to_string()
-                            } else {
-                                format!("Session {}: Layer {}/{}", session_id, state.layer_idx, model.config.n_layer)
-                            }
-                        }
-                        None => format!("Error: No forward state for session {}", session_id),
-                    }
-                })
-            }
-            None => "Error: No model".to_string(),
-        }
-    });
-    result
-}
-
-
-
-/// Finish forward pass for a specific session
-#[update]
-fn finish_forward_session(session_id: u32) -> String {
-    let result = MODEL.with(|m| {
-        let model_ref = m.borrow();
-        match model_ref.as_ref() {
-            Some(model) => {
-                FWD_STATES.with(|fwd| {
-                    let mut fwd_ref = fwd.borrow_mut();
-                    match fwd_ref.get_mut(&session_id) {
-                        Some(state) => {
-                            // Final norm and sample from the last position in hidden
-                            let sample_len = state.new_len;
-                            let next_token = model.final_norm_and_sample(&state.hidden, sample_len);
-                            
-                            // Add token to generation state
-                            GEN_STATES.with(|gen| {
-                                let mut gen_ref = gen.borrow_mut();
-                                if let Some(gen_state) = gen_ref.get_mut(&session_id) {
-                                    gen_state.tokens.push(next_token);
-                                    gen_state.generated_count += 1;
-                                }
-                            });
-                            
-                            // Mark as done but keep cache
-                            state.phase = ForwardPhase::Done;
-                            
-                            model.decode_token(next_token)
-                        }
-                        None => format!("Error: No forward state for session {}", session_id),
-                    }
-                })
-            }
-            None => "Error: No model".to_string(),
-        }
-    });
-    result
-}
-
 /// Finish forward pass and sample next token
 #[update]
 fn finish_forward() -> String {
@@ -404,9 +260,9 @@ fn finish_forward() -> String {
         let model_ref = m.borrow();
         match model_ref.as_ref() {
             Some(model) => {
-                FWD_STATES.with(|fwd| {
+                FWD_STATE.with(|fwd| {
                     let mut fwd_ref = fwd.borrow_mut();
-                    match fwd_ref.get_mut(&0) {
+                    match fwd_ref.as_mut() {
                         Some(state) => {
                             // Final norm and sample from the last position in hidden
                             // In cached mode, hidden only has new_len positions
@@ -415,9 +271,9 @@ fn finish_forward() -> String {
                             
                             
                             // Add token to generation state
-                            GEN_STATES.with(|gen| {
+                            GEN_STATE.with(|gen| {
                                 let mut gen_ref = gen.borrow_mut();
-                                if let Some(gen_state) = gen_ref.get_mut(&0) {
+                                if let Some(gen_state) = gen_ref.as_mut() {
                                     gen_state.tokens.push(next_token);
                                     gen_state.generated_count += 1;
                                 }
@@ -448,14 +304,14 @@ fn generate_next_token() -> String {
         let model_ref = m.borrow();
         match model_ref.as_ref() {
             Some(model) => {
-                GEN_STATES.with(|gen| {
+                GEN_STATE.with(|gen| {
                     let mut gen_ref = gen.borrow_mut();
-                    match gen_ref.get_mut(&0) {
+                    match gen_ref.as_mut() {
                         Some(gen_state) => {
                             // 1. Get KV Cache from ForwardState
-                            let mut cache_opt = FWD_STATES.with(|fwd| {
+                            let mut cache_opt = FWD_STATE.with(|fwd| {
                                 let mut fwd_ref = fwd.borrow_mut();
-                                fwd_ref.get_mut(&0).and_then(|s| s.kv_cache.take())
+                                fwd_ref.as_mut().and_then(|s| s.kv_cache.take())
                             });
                             
                             if let Some(mut cache) = cache_opt {
@@ -483,8 +339,8 @@ fn generate_next_token() -> String {
                                 gen_state.generated_count += 1;
                                 
                                 // 4. Restore Cache to ForwardState
-                                FWD_STATES.with(|fwd| {
-                                    fwd.borrow_mut().insert(0, ForwardState {
+                                FWD_STATE.with(|fwd| {
+                                    *fwd.borrow_mut() = Some(ForwardState {
                                         hidden: curr_hidden, // Not typically needed next time but good for consistency
                                         layer_idx: model.config.n_layer,
                                         seq_len: cache.cached_len, // Full length including new
@@ -508,147 +364,80 @@ fn generate_next_token() -> String {
     })
 }
 
-/// Start a new session with a specific ID
+/// Generate N tokens in a single call for maximum single-session throughput
+/// This reduces round-trip overhead by generating multiple tokens per update call
 #[update]
-fn start_session(session_id: u32, prompt: String, max_tokens: u32) -> String {
+fn generate_n_tokens(n: u32) -> String {
     MODEL.with(|m| {
         let model_ref = m.borrow();
         match model_ref.as_ref() {
             Some(model) => {
-                let tokens = model.tokenize(&prompt);
-                
-                // Clear state for this session
-                FWD_STATES.with(|fwd| {
-                    fwd.borrow_mut().remove(&session_id);
-                });
-                
-                GEN_STATES.with(|s| {
-                    s.borrow_mut().insert(session_id, GenerationState {
-                        tokens,
-                        max_tokens: max_tokens as usize,
-                        generated_count: 0,
-                    });
-                });
-                format!("Session {}: Started", session_id)
+                GEN_STATE.with(|gen| {
+                    let mut gen_ref = gen.borrow_mut();
+                    match gen_ref.as_mut() {
+                        Some(gen_state) => {
+                            let mut cache_opt = FWD_STATE.with(|fwd| {
+                                let mut fwd_ref = fwd.borrow_mut();
+                                fwd_ref.as_mut().and_then(|s| s.kv_cache.take())
+                            });
+                            
+                            if let Some(mut cache) = cache_opt {
+                                let mut result = String::new();
+                                let tokens_remaining = gen_state.max_tokens.saturating_sub(gen_state.generated_count);
+                                let tokens_to_generate = std::cmp::min(n, tokens_remaining as u32);
+                                
+                                for _ in 0..tokens_to_generate {
+                                    // Get last token to embed
+                                    let last_token = gen_state.tokens.last().copied().unwrap_or(0);
+                                    let hidden = model.embed_tokens(&[last_token]);
+                                    
+                                    // Run through all layers with cache
+                                    let mut curr_hidden = hidden;
+                                    for layer_idx in 0..model.config.n_layer {
+                                        curr_hidden = model.run_layer_cached(
+                                            layer_idx,
+                                            &curr_hidden,
+                                            1,
+                                            &mut cache
+                                        );
+                                    }
+                                    
+                                    cache.update_len(1);
+                                    
+                                    // Sample next token
+                                    let next_token = model.final_norm_and_sample(&curr_hidden, 1);
+                                    gen_state.tokens.push(next_token);
+                                    gen_state.generated_count += 1;
+                                    
+                                    // Decode and append to result
+                                    result.push_str(&model.decode_token(next_token));
+                                }
+                                
+                                // Restore cache
+                                FWD_STATE.with(|fwd| {
+                                    *fwd.borrow_mut() = Some(ForwardState {
+                                        hidden: vec![],
+                                        layer_idx: model.config.n_layer,
+                                        seq_len: cache.cached_len,
+                                        new_len: 0,
+                                        phase: ForwardPhase::Done,
+                                        kv_cache: Some(cache),
+                                    });
+                                });
+                                
+                                result
+                            } else {
+                                "Error: No KV cache".to_string()
+                            }
+                        }
+                        None => "Error: No generation started".to_string(),
+                    }
+                })
             }
             None => "Error: No model".to_string(),
         }
     })
 }
-
-/// Generate next tokens for a batch of sessions
-#[update]
-fn generate_batch(session_ids: Vec<u32>) -> Vec<String> {
-    MODEL.with(|m| {
-        let model_ref = m.borrow();
-        match model_ref.as_ref() {
-            Some(model) => {
-                // 1. Collect states and prepare batch
-                let mut batch_hidden = Vec::new();
-                let mut batch_caches = Vec::new(); // Will hold KVCache
-                let mut active_ids = Vec::new();
-                
-                // We must take the states out to mutate them together
-                FWD_STATES.with(|fwd| {
-                    let mut fwd_map = fwd.borrow_mut();
-                    
-                    for &id in &session_ids {
-                        // We need the cache. If it's in FWD_STATES, take it.
-                        // If not, check if we have a GEN_STATE (and need to init cache? No, prompt must be done).
-                        // Note: generate_next_token leaves cache in FWD_STATES.
-                        
-                        if let Some(mut state) = fwd_map.remove(&id) {
-                            if let Some(cache) = state.kv_cache.take() {
-                                // Get last token from GEN_STATES to embed
-                                let last_token = GEN_STATES.with(|gen| {
-                                    gen.borrow().get(&id).and_then(|g| g.tokens.last().copied()).unwrap_or(0)
-                                });
-                                
-                                let hidden = model.embed_tokens(&[last_token]);
-                                batch_hidden.extend_from_slice(&hidden);
-                                batch_caches.push(cache);
-                                active_ids.push(id);
-                                
-                                // Put "shell" state back or keep it out? Keeping it out is easier.
-                                // We will reconstruct it later.
-                            }
-                        }
-                    }
-                });
-                
-                if active_ids.is_empty() {
-                    return session_ids.iter().map(|_| "Error: No active state".to_string()).collect();
-                }
-
-                // 2. Run Batched Layers
-                let mut curr_hidden = batch_hidden;
-                let batch_size = active_ids.len();
-                let new_len = 1;
-                
-                for layer_idx in 0..model.config.n_layer {
-                    curr_hidden = model.run_layer_batched(
-                        layer_idx,
-                        &curr_hidden,
-                        &mut batch_caches
-                    );
-                }
-                
-                // Update cache lengths (all proceeded by 1)
-                for cache in &mut batch_caches {
-                    cache.update_len(new_len);
-                }
-                
-                // 3. Sample and Update
-                let mut results = BTreeMap::new(); // Map ID -> Result string
-                let n_embd = model.config.n_embd;
-                
-                for (i, &id) in active_ids.iter().enumerate() {
-                    let start = i * n_embd;
-                    let hidden_slice = &curr_hidden[start..start + n_embd];
-                    
-                    // Sample
-                    let next_token = model.final_norm_and_sample(hidden_slice, 1);
-                    
-                    // Decode
-                    let token_str = model.decode_token(next_token);
-                    results.insert(id, token_str);
-                    
-                    // Update Gen State
-                    GEN_STATES.with(|gen| {
-                       if let Some(gs) = gen.borrow_mut().get_mut(&id) {
-                           gs.tokens.push(next_token);
-                           gs.generated_count += 1;
-                       } 
-                    });
-                }
-                
-                // Actually, let's consume batch_caches
-                for (i, cache) in batch_caches.into_iter().enumerate() {
-                    let id = active_ids[i];
-                    // Reconstruct state
-                     FWD_STATES.with(|fwd| {
-                        fwd.borrow_mut().insert(id, ForwardState {
-                            hidden: Vec::new(), // optimizing output size
-                            layer_idx: model.config.n_layer,
-                            seq_len: cache.cached_len,
-                            new_len: 0,
-                            phase: ForwardPhase::Done,
-                            kv_cache: Some(cache),
-                        });
-                    });
-                }
-                
-                // 4. Return results strictly matching input order
-                session_ids.iter().map(|id| {
-                    results.get(id).cloned().unwrap_or_else(|| "Error".to_string())
-                }).collect()
-            }
-            None => vec!["Error: No model".to_string(); session_ids.len()],
-        }
-    })
-}
-
-
 
 /// Get current result (Session 0)
 #[query]
@@ -657,9 +446,9 @@ fn get_result() -> String {
         let model_ref = m.borrow();
         match model_ref.as_ref() {
             Some(model) => {
-                GEN_STATES.with(|gen| {
+                GEN_STATE.with(|gen| {
                     let gen_ref = gen.borrow();
-                    match gen_ref.get(&0) {
+                    match gen_ref.as_ref() {
                         Some(gen_state) => model.decode_tokens(&gen_state.tokens),
                         None => "No generation".to_string(),
                     }
@@ -673,9 +462,9 @@ fn get_result() -> String {
 /// Check if more tokens needed
 #[query]
 fn generation_status() -> String {
-    GEN_STATES.with(|gen| {
+    GEN_STATE.with(|gen| {
         let gen_ref = gen.borrow();
-        match gen_ref.get(&0) {
+        match gen_ref.as_ref() {
             Some(s) => format!(
                 "{{\"tokens\":{},\"generated\":{},\"max\":{},\"done\":{}}}",
                 s.tokens.len(), s.generated_count, s.max_tokens,

@@ -33,30 +33,62 @@ except ImportError:
         return packed.to(torch.uint8)
 
 
-def quantize_to_ternary_packed(weight: torch.Tensor) -> tuple:
+def quantize_to_bitmask_ternary(weight: torch.Tensor) -> tuple:
     """
-    Convert ghost weights to pure ternary {-1, 0, +1} and pack.
-    Returns (packed_data, original_shape) - ~16x smaller than sparse!
-    Handles dimensions not divisible by 4 by padding with zeros.
+    Convert ghost weights to bitmask + sign representation.
+    Returns (bitmask, sign_bits, original_shape, sparsity_pct)
+    
+    Format:
+    - bitmask: 1 bit per position (1 = non-zero)
+    - sign_bits: 1 bit per non-zero (0 = -1, 1 = +1)
+    
+    This is smaller than packed format AND enables sparse iteration.
     """
-    # Round to nearest ternary value
-    w_ternary = torch.round(weight).clamp(-1, 1)
-    original_shape = w_ternary.shape
+    w_ternary = torch.round(weight).clamp(-1, 1).flatten()
+    original_shape = weight.shape
+    total = w_ternary.numel()
     
-    # Pad last dimension to multiple of 4 if needed
-    last_dim = w_ternary.shape[-1]
-    pad_size = (4 - last_dim % 4) % 4
-    if pad_size > 0:
-        # Pad with zeros (which pack to 0b01 = "0" value)
-        pad_shape = list(w_ternary.shape)
-        pad_shape[-1] = pad_size
-        padding = torch.zeros(pad_shape, dtype=w_ternary.dtype, device=w_ternary.device)
-        w_ternary = torch.cat([w_ternary, padding], dim=-1)
+    # Create bitmask (1 = non-zero)
+    nonzero_mask = (w_ternary != 0)
     
-    # Pack 4 values per byte
-    packed = pack_ternary_weights(w_ternary)
+    # Pack bitmask into bytes (8 positions per byte)
+    # Pad to multiple of 8
+    padded_len = (total + 7) // 8 * 8
+    padded_mask = torch.zeros(padded_len, dtype=torch.bool)
+    padded_mask[:total] = nonzero_mask
     
-    return packed.numpy(), original_shape
+    bitmask_bytes = []
+    for i in range(0, padded_len, 8):
+        byte_val = 0
+        for bit in range(8):
+            if padded_mask[i + bit]:
+                byte_val |= (1 << bit)
+        bitmask_bytes.append(byte_val)
+    bitmask = np.array(bitmask_bytes, dtype=np.uint8)
+    
+    # Get signs for non-zero elements only (0 = -1, 1 = +1)
+    nonzero_values = w_ternary[nonzero_mask]
+    signs = (nonzero_values == 1)  # True = +1, False = -1
+    
+    # Pack signs into bytes
+    num_nonzero = len(signs)
+    padded_signs_len = (num_nonzero + 7) // 8 * 8
+    padded_signs = torch.zeros(padded_signs_len, dtype=torch.bool)
+    padded_signs[:num_nonzero] = signs
+    
+    sign_bytes = []
+    for i in range(0, padded_signs_len, 8):
+        byte_val = 0
+        for bit in range(8):
+            if padded_signs[i + bit]:
+                byte_val |= (1 << bit)
+        sign_bytes.append(byte_val)
+    sign_bits = np.array(sign_bytes, dtype=np.uint8)
+    
+    # Calculate sparsity
+    sparsity_pct = 100.0 * (1 - num_nonzero / total)
+    
+    return bitmask, sign_bits, original_shape, sparsity_pct, num_nonzero
 
 
 def quantize_embedding(embedding: torch.Tensor) -> tuple:
@@ -113,8 +145,8 @@ def compress_model(checkpoint_path: str, output_path: str, vocab_path: str = Non
         # Magic number
         f.write(b'SPIN')
         
-        # Version (2 = packed ternary format)
-        f.write(struct.pack('<H', 2))
+        # Version (4 = bitmask ternary format - smallest + sparse)
+        f.write(struct.pack('<H', 4))
         
         # Config as JSON
         config_json = json.dumps(model_args).encode('utf-8')
@@ -150,23 +182,36 @@ def compress_model(checkpoint_path: str, output_path: str, vocab_path: str = Non
             elif '.weight' in name and ('wq' in name or 'wk' in name or 'wv' in name or 
                                          'wo' in name or 'gate_proj' in name or 
                                          'up_proj' in name or 'down_proj' in name):
-                # Ternary Octonion weight - PACKED format (16x smaller)
-                print(f"  [TERNARY] {name}: {param_data.shape}")
-                packed, shape = quantize_to_ternary_packed(param_data)
+                # Ternary Octonion weight - BITMASK format (smallest size + sparse iteration)
+                bitmask, sign_bits, shape, sparsity, num_nonzero = quantize_to_bitmask_ternary(param_data)
+                total = 1
+                for d in shape:
+                    total *= d
+                packed_size = total // 4  # What packed format would use
+                bitmask_size = len(bitmask) + len(sign_bits)
+                savings = 100 * (1 - bitmask_size / packed_size) if packed_size > 0 else 0
+                print(f"  [BITMASK] {name}: {param_data.shape} ({sparsity:.1f}% sparse, {num_nonzero} non-zero, {savings:.0f}% smaller than packed)")
                 
                 # Write marker + name
-                f.write(b'T')  # Ternary marker
+                f.write(b'B')  # Bitmask Weight marker
                 name_bytes = name.encode('utf-8')
                 f.write(struct.pack('<H', len(name_bytes)))
                 f.write(name_bytes)
                 
-                # Write original shape (needed to unpack)
+                # Write original shape
                 f.write(struct.pack('<B', len(shape)))
                 for dim in shape:
                     f.write(struct.pack('<I', dim))
                 
-                # Write packed data directly (uint8 array)
-                write_array(f, packed, 'i8')  # i8 for uint8 storage
+                # Write num_nonzero
+                f.write(struct.pack('<I', num_nonzero))
+                
+                # Write bitmask and sign arrays
+                f.write(struct.pack('<I', len(bitmask)))
+                f.write(bitmask.tobytes())
+                f.write(struct.pack('<I', len(sign_bits)))
+                f.write(sign_bits.tobytes())
+                
                 ternary_count += 1
                 
             elif '.beta' in name:

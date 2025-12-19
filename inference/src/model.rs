@@ -27,23 +27,27 @@ pub struct ModelConfig {
     pub block_size: usize,
 }
 
-/// Ternary weight (dense, not sparse for simplicity in WASM)
-pub struct TernaryWeight {
-    data: Vec<i8>,         // Flattened ternary values
-    shape: Vec<usize>,     // [8, out_dim, in_dim] for octonion
-    beta: Vec<f32>,        // Scale factors
+/// Bitmask ternary weight - smallest format with sparse iteration
+/// bitmask: 1 bit per position (1 = non-zero)
+/// sign_bits: 1 bit per non-zero (0 = -1, 1 = +1)
+pub struct BitmaskWeight {
+    bitmask: Vec<u8>,      // 1 bit per position marking non-zero
+    sign_bits: Vec<u8>,    // 1 bit per non-zero, packed (0=-1, 1=+1)
+    num_nonzero: usize,    // Total count of non-zeros
+    shape: (usize, usize), // (out_dim, in_dim) logical dimensions
+    beta: Vec<f32>,        // Per-output-part scaling
 }
 
 pub struct TransformerLayer {
     attn_norm: Vec<f32>,
-    wq: TernaryWeight,
-    wk: TernaryWeight,
-    wv: TernaryWeight,
-    wo: TernaryWeight,
+    wq: BitmaskWeight,
+    wk: BitmaskWeight,
+    wv: BitmaskWeight,
+    wo: BitmaskWeight,
     ffn_norm: Vec<f32>,
-    gate_proj: TernaryWeight,
-    up_proj: TernaryWeight,
-    down_proj: TernaryWeight,
+    gate_proj: BitmaskWeight,
+    up_proj: BitmaskWeight,
+    down_proj: BitmaskWeight,
 }
 
 /// KV Cache for efficient autoregressive generation
@@ -92,9 +96,9 @@ impl SpinNetModel {
         }
         cursor += 4;
         
-        // Version (1 = sparse, 2 = packed)
+        // Version (1 = old sparse, 2 = packed, 3 = new sparse)
         let version = read_u16(data, &mut cursor)?;
-        if version != 1 && version != 2 {
+        if version != 1 && version != 2 && version != 3 && version != 4 {
             return Err(format!("Unsupported version: {}", version));
         }
         
@@ -118,7 +122,7 @@ impl SpinNetModel {
         let mut layers: Vec<TransformerLayer> = Vec::new();
         
         // Weight name -> data storage
-        let mut ternary_weights: std::collections::HashMap<String, TernaryWeight> = std::collections::HashMap::new();
+        let mut bitmask_weights: std::collections::HashMap<String, BitmaskWeight> = std::collections::HashMap::new();
         let mut norm_weights: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
         let mut scale_weights: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
         
@@ -143,117 +147,77 @@ impl SpinNetModel {
                         embeddings = arr.iter().map(|&x| x as f32 * scale).collect();
                     }
                 }
-                b'T' => {
-                    // Ternary weight
+                b'B' => {
+                    // Bitmask ternary weight (smallest + sparse iteration)
                     let name = read_name(data, &mut cursor)?;
+                    
+                    // Read shape
                     let ndim = data[cursor] as usize;
                     cursor += 1;
                     
-                    let mut shape = Vec::new();
+                    let mut shape_vec = Vec::new();
                     for _ in 0..ndim {
-                        shape.push(read_u32(data, &mut cursor)? as usize);
+                        shape_vec.push(read_u32(data, &mut cursor)? as usize);
                     }
                     
-                    let dense = if version == 2 {
-                        // v2: Packed format (4 values per byte)
-                        // Read packed array directly
-                        let packed = read_array_u8(data, &mut cursor)?;
-                        
-                        // Calculate original size (before padding)
-                        let total_size: usize = shape.iter().product();
-                        let original_last_dim = *shape.last().unwrap_or(&1);
-                        
-                        // Padded last dim = ceil(original / 4) * 4
-                        let padded_last_dim = (original_last_dim + 3) / 4 * 4;
-                        
-                        // First unpack ALL bytes (including padding)
-                        let mut all_unpacked = Vec::with_capacity(packed.len() * 4);
-                        for byte in packed.iter() {
-                            let v0 = (((byte >> 6) & 0b11) as i8) - 1;
-                            let v1 = (((byte >> 4) & 0b11) as i8) - 1;
-                            let v2 = (((byte >> 2) & 0b11) as i8) - 1;
-                            let v3 = ((byte & 0b11) as i8) - 1;
-                            all_unpacked.push(v0);
-                            all_unpacked.push(v1);
-                            all_unpacked.push(v2);
-                            all_unpacked.push(v3);
-                        }
-                        
-                        // Now copy only the non-padded values (stride-aware)
-                        // For shape [d0, d1, ..., dn-1, last_dim]:
-                        // - Unpacked has shape [..., padded_last_dim]
-                        // - We need values [..., 0..original_last_dim]
-                        let mut unpacked = Vec::with_capacity(total_size);
-                        
-                        if padded_last_dim == original_last_dim {
-                            // No padding, just use all values
-                            unpacked = all_unpacked;
-                            unpacked.truncate(total_size);
-                        } else {
-                            // Remove padding from each row
-                            let num_rows = total_size / original_last_dim;
-                            for row in 0..num_rows {
-                                let src_start = row * padded_last_dim;
-                                for i in 0..original_last_dim {
-                                    if src_start + i < all_unpacked.len() {
-                                        unpacked.push(all_unpacked[src_start + i]);
-                                    } else {
-                                        unpacked.push(0); // Safety fallback
-                                    }
-                                }
-                            }
-                        }
-                        
-                        unpacked
+                    // Shape is [8, out_per_part, in_per_part] for 3D octonion weights
+                    let (out_dim, in_dim) = if ndim == 3 {
+                        let out_per_part = shape_vec[1];
+                        let in_per_part = shape_vec[2];
+                        (8 * out_per_part, 8 * in_per_part)
+                    } else if ndim == 2 {
+                        (shape_vec[0], shape_vec[1])
                     } else {
-                        // v1: Sparse CSR format
-                        let nnz = read_u32(data, &mut cursor)? as usize;
-                        
-                        // Read indices array - it has shape [nnz, ndim] from torch.nonzero
-                        let (_idx_dtype, _idx_shape) = read_array_header(data, &mut cursor)?;
-                        let idx_total = nnz * ndim;
-                        let mut indices_raw = Vec::with_capacity(idx_total);
-                        for _ in 0..idx_total {
-                            indices_raw.push(read_i32_single(data, &mut cursor)?);
-                        }
-                        
-                        // Read signs array
-                        let signs = read_array_i8(data, &mut cursor)?;
-                        
-                        // Convert sparse to dense
-                        let total_size: usize = shape.iter().product();
-                        let mut dense = vec![0i8; total_size];
-                        
-                        // Compute strides for the shape
-                        let mut strides = vec![1usize; ndim];
-                        for d in (0..ndim-1).rev() {
-                            strides[d] = strides[d + 1] * shape[d + 1];
-                        }
-                        
-                        // Each row of indices is one coordinate [d0, d1, ..., d_{ndim-1}]
-                        for i in 0..nnz.min(signs.len()) {
-                            let mut flat_idx = 0usize;
-                            for d in 0..ndim {
-                                let coord_idx = i * ndim + d;
-                                if coord_idx < indices_raw.len() {
-                                    let coord = indices_raw[coord_idx] as usize;
-                                    flat_idx += coord * strides[d];
-                                }
-                            }
-                            if flat_idx < dense.len() && i < signs.len() {
-                                dense[flat_idx] = signs[i];
-                            }
-                        }
-                        dense
+                        (1, 1)
                     };
                     
-                    let total_size: usize = shape.iter().product();
-                    let beta_size = total_size / shape.last().copied().unwrap_or(1);
-                    ternary_weights.insert(name, TernaryWeight {
-                        data: dense,
-                        shape,
-                        beta: vec![1.0; beta_size],
+                    // Read num_nonzero
+                    let num_nonzero = read_u32(data, &mut cursor)? as usize;
+                    
+                    // Read bitmask bytes
+                    let bitmask_len = read_u32(data, &mut cursor)? as usize;
+                    let bitmask = data[cursor..cursor + bitmask_len].to_vec();
+                    cursor += bitmask_len;
+                    
+                    // Read sign bytes
+                    let sign_len = read_u32(data, &mut cursor)? as usize;
+                    let sign_bits = data[cursor..cursor + sign_len].to_vec();
+                    cursor += sign_len;
+                    
+                    bitmask_weights.insert(name, BitmaskWeight {
+                        bitmask,
+                        sign_bits,
+                        num_nonzero,
+                        shape: (out_dim, in_dim),
+                        beta: vec![1.0; out_dim / 8],  // beta is per out_per_part
                     });
+                }
+                b'W' => {
+                    // Legacy sparse format - skip with warning
+                    let name = read_name(data, &mut cursor)?;
+                    let ndim = data[cursor] as usize;
+                    cursor += 1;
+                    for _ in 0..ndim {
+                        cursor += 4;
+                    }
+                    let num_pos = read_u32(data, &mut cursor)? as usize;
+                    let num_neg = read_u32(data, &mut cursor)? as usize;
+                    cursor += (num_pos + num_neg) * 4;
+                    ic_cdk::println!("Warning: Skipping legacy sparse weight: {}", name);
+                }
+                b'T' => {
+                    // Legacy packed ternary - skip with warning
+                    let name = read_name(data, &mut cursor)?;
+                    let ndim = data[cursor] as usize;
+                    cursor += 1;
+                    for _ in 0..ndim {
+                        cursor += 4; // Skip u32 dims
+                    }
+                    // Skip the array data
+                    let (_dtype, arr_shape) = read_array_header(data, &mut cursor)?;
+                    let arr_size: usize = arr_shape.iter().product();
+                    cursor += arr_size;
+                    ic_cdk::println!("Warning: Skipping legacy packed weight: {}", name);
                 }
                 b'N' => {
                     // Norm weights
@@ -297,23 +261,25 @@ impl SpinNetModel {
         for layer_idx in 0..config.n_layer {
             let prefix = format!("layers.{}", layer_idx);
             
-            let mut get_ternary = |suffix: &str| -> TernaryWeight {
+            let mut get_bitmask = |suffix: &str| -> BitmaskWeight {
                 let weight_key = format!("{}.{}", prefix, suffix);
-                // Beta key has same path but .beta instead of .weight
                 let beta_key = weight_key.replace(".weight", ".beta");
                 
-                let mut tw = ternary_weights.remove(&weight_key).unwrap_or_else(|| TernaryWeight {
-                    data: vec![0; config.n_embd * config.n_embd / 8],
-                    shape: vec![8, config.n_embd / 8, config.n_embd / 8],
-                    beta: vec![1.0; config.n_embd / 8],
+                let out_per_part = config.n_embd / 8;
+                let mut bw = bitmask_weights.remove(&weight_key).unwrap_or_else(|| BitmaskWeight {
+                    bitmask: Vec::new(),
+                    sign_bits: Vec::new(),
+                    num_nonzero: 0,
+                    shape: (config.n_embd, config.n_embd),
+                    beta: vec![1.0; out_per_part],
                 });
                 
                 // Apply beta scales if available
                 if let Some(beta) = scale_weights.remove(&beta_key) {
-                    tw.beta = beta;
+                    bw.beta = beta;
                 }
                 
-                tw
+                bw
             };
             
             let mut get_norm = |suffix: &str| -> Vec<f32> {
@@ -323,14 +289,14 @@ impl SpinNetModel {
             
             layers.push(TransformerLayer {
                 attn_norm: get_norm("attention_norm.weight"),
-                wq: get_ternary("attention.wq.weight"),
-                wk: get_ternary("attention.wk.weight"),
-                wv: get_ternary("attention.wv.weight"),
-                wo: get_ternary("attention.wo.weight"),
+                wq: get_bitmask("attention.wq.weight"),
+                wk: get_bitmask("attention.wk.weight"),
+                wv: get_bitmask("attention.wv.weight"),
+                wo: get_bitmask("attention.wo.weight"),
                 ffn_norm: get_norm("ffn_norm.weight"),
-                gate_proj: get_ternary("feed_forward.gate_proj.weight"),
-                up_proj: get_ternary("feed_forward.up_proj.weight"),
-                down_proj: get_ternary("feed_forward.down_proj.weight"),
+                gate_proj: get_bitmask("feed_forward.gate_proj.weight"),
+                up_proj: get_bitmask("feed_forward.up_proj.weight"),
+                down_proj: get_bitmask("feed_forward.down_proj.weight"),
             });
         }
         
@@ -472,9 +438,9 @@ impl SpinNetModel {
         }
         
         // Q, K, V projections (only new positions)
-        let mut q_new = self.ternary_matmul(&normed, &layer.wq, new_len, n_embd, n_embd);
-        let mut k_new = self.ternary_matmul(&normed, &layer.wk, new_len, n_embd, n_embd);
-        let v_new = self.ternary_matmul(&normed, &layer.wv, new_len, n_embd, n_embd);
+        let mut q_new = self.bitmask_matmul(&normed, &layer.wq, new_len, n_embd, n_embd);
+        let mut k_new = self.bitmask_matmul(&normed, &layer.wk, new_len, n_embd, n_embd);
+        let v_new = self.bitmask_matmul(&normed, &layer.wv, new_len, n_embd, n_embd);
         
         // Apply RoPE to new Q and K (at positions cache.cached_len ... cache.cached_len + new_len - 1)
         self.apply_rope_at_pos(&mut q_new, &mut k_new, cache.cached_len, new_len, head_dim);
@@ -490,7 +456,7 @@ impl SpinNetModel {
         let attn_out = attention_cached(&q_new, k_full, v_full, new_len, full_len, n_head, head_dim);
         
         // Output projection
-        let o = self.ternary_matmul(&attn_out, &layer.wo, new_len, n_embd, n_embd);
+        let o = self.bitmask_matmul(&attn_out, &layer.wo, new_len, n_embd, n_embd);
         
         // Residual connection
         let mut h: Vec<f32> = hidden_new.iter().zip(o.iter()).map(|(a, b)| a + b).collect();
@@ -502,10 +468,9 @@ impl SpinNetModel {
             normed2.extend(rms_norm(slice, &layer.ffn_norm, 1e-6));
         }
         
-        let hidden_per_part = if layer.gate_proj.shape.len() >= 2 { layer.gate_proj.shape[1] } else { 86 };
-        let hidden_dim = hidden_per_part * 8;
-        let gate = self.ternary_matmul(&normed2, &layer.gate_proj, new_len, n_embd, hidden_dim);
-        let up = self.ternary_matmul(&normed2, &layer.up_proj, new_len, n_embd, hidden_dim);
+        let hidden_dim = layer.gate_proj.shape.0;
+        let gate = self.bitmask_matmul(&normed2, &layer.gate_proj, new_len, n_embd, hidden_dim);
+        let up = self.bitmask_matmul(&normed2, &layer.up_proj, new_len, n_embd, hidden_dim);
         
         // SwiGLU
         let mut ffn_hidden = vec![0.0f32; new_len * hidden_dim];
@@ -513,7 +478,7 @@ impl SpinNetModel {
             ffn_hidden[i] = silu(gate[i]) * up[i];
         }
         
-        let down = self.ternary_matmul(&ffn_hidden, &layer.down_proj, new_len, hidden_dim, n_embd);
+        let down = self.bitmask_matmul(&ffn_hidden, &layer.down_proj, new_len, hidden_dim, n_embd);
         
         // Residual
         for i in 0..h.len().min(down.len()) {
@@ -547,9 +512,9 @@ impl SpinNetModel {
         
         // 2. QKV Projections (Batched!)
         // Separate matmuls because weights are separate
-        let q_batch = self.ternary_matmul(&h, &layer.wq, batch, n_embd, n_embd);
-        let k_batch = self.ternary_matmul(&h, &layer.wk, batch, n_embd, n_embd);
-        let v_batch = self.ternary_matmul(&h, &layer.wv, batch, n_embd, n_embd);
+        let q_batch = self.bitmask_matmul(&h, &layer.wq, batch, n_embd, n_embd);
+        let k_batch = self.bitmask_matmul(&h, &layer.wk, batch, n_embd, n_embd);
+        let v_batch = self.bitmask_matmul(&h, &layer.wv, batch, n_embd, n_embd);
         
         // 3. Attention (Per-sequence)
         let mut attn_out = vec![0.0f32; batch * n_embd];
@@ -595,7 +560,7 @@ impl SpinNetModel {
         }
         
         // 4. Output Projection (Batched!)
-        let proj_out = self.ternary_matmul(&attn_out, &layer.wo, batch, n_embd, n_embd);
+        let proj_out = self.bitmask_matmul(&attn_out, &layer.wo, batch, n_embd, n_embd);
         
         // Residual 1
         for i in 0..hidden_batch.len() {
@@ -614,11 +579,10 @@ impl SpinNetModel {
         }
         
         // 6. Gate/Up Projection (Batched!)
-        let hidden_per_part = if layer.gate_proj.shape.len() >= 2 { layer.gate_proj.shape[1] } else { 86 };
-        let hidden_dim = hidden_per_part * 8;
+        let hidden_dim = layer.gate_proj.shape.0;
         
-        let gate = self.ternary_matmul(&ffn_in, &layer.gate_proj, batch, n_embd, hidden_dim);
-        let up = self.ternary_matmul(&ffn_in, &layer.up_proj, batch, n_embd, hidden_dim);
+        let gate = self.bitmask_matmul(&ffn_in, &layer.gate_proj, batch, n_embd, hidden_dim);
+        let up = self.bitmask_matmul(&ffn_in, &layer.up_proj, batch, n_embd, hidden_dim);
         
         // 7. SiLU and Element-wise mult (Batch-parallel)
         let mut ffn_inter = vec![0.0f32; batch * hidden_dim];
@@ -632,7 +596,7 @@ impl SpinNetModel {
         }
         
         // 8. Down Projection (Batched!)
-        let ffn_out = self.ternary_matmul(&ffn_inter, &layer.down_proj, batch, hidden_dim, n_embd);
+        let ffn_out = self.bitmask_matmul(&ffn_inter, &layer.down_proj, batch, hidden_dim, n_embd);
         
         // Residual 2
         for i in 0..h.len() {
@@ -779,9 +743,9 @@ impl SpinNetModel {
         }
         
         // Q, K, V projections
-        let mut q = self.ternary_matmul(&normed, &layer.wq, seq_len, n_embd, n_embd);
-        let mut k = self.ternary_matmul(&normed, &layer.wk, seq_len, n_embd, n_embd);
-        let v = self.ternary_matmul(&normed, &layer.wv, seq_len, n_embd, n_embd);
+        let mut q = self.bitmask_matmul(&normed, &layer.wq, seq_len, n_embd, n_embd);
+        let mut k = self.bitmask_matmul(&normed, &layer.wk, seq_len, n_embd, n_embd);
+        let v = self.bitmask_matmul(&normed, &layer.wv, seq_len, n_embd, n_embd);
         
         // Apply RoPE to Q and K
         self.apply_rope(&mut q, &mut k, seq_len, head_dim);
@@ -790,7 +754,7 @@ impl SpinNetModel {
         let attn_out = attention(&q, &k, &v, n_head, head_dim);
         
         // Output projection
-        let o = self.ternary_matmul(&attn_out, &layer.wo, seq_len, n_embd, n_embd);
+        let o = self.bitmask_matmul(&attn_out, &layer.wo, seq_len, n_embd, n_embd);
         
         // Residual
         let mut h: Vec<f32> = x.iter().zip(o.iter()).map(|(a, b)| a + b).collect();
@@ -803,10 +767,9 @@ impl SpinNetModel {
         }
         
         // FFN hidden_dim derived from weight shape: gate_proj is [8, hidden/8, n_embd/8]
-        let hidden_per_part = if layer.gate_proj.shape.len() >= 2 { layer.gate_proj.shape[1] } else { 86 };
-        let hidden_dim = hidden_per_part * 8;
-        let gate = self.ternary_matmul(&normed2, &layer.gate_proj, seq_len, n_embd, hidden_dim);
-        let up = self.ternary_matmul(&normed2, &layer.up_proj, seq_len, n_embd, hidden_dim);
+        let hidden_dim = layer.gate_proj.shape.0;
+        let gate = self.bitmask_matmul(&normed2, &layer.gate_proj, seq_len, n_embd, hidden_dim);
+        let up = self.bitmask_matmul(&normed2, &layer.up_proj, seq_len, n_embd, hidden_dim);
         
         // SwiGLU activation
         let mut ffn_hidden = vec![0.0f32; seq_len * hidden_dim];
@@ -814,7 +777,7 @@ impl SpinNetModel {
             ffn_hidden[i] = silu(gate[i]) * up[i];
         }
         
-        let down = self.ternary_matmul(&ffn_hidden, &layer.down_proj, seq_len, hidden_dim, n_embd);
+        let down = self.bitmask_matmul(&ffn_hidden, &layer.down_proj, seq_len, hidden_dim, n_embd);
         
         // Residual
         for i in 0..h.len().min(down.len()) {
@@ -824,11 +787,12 @@ impl SpinNetModel {
         h
     }
     
-    /// Octonion ternary matmul using Cayley-Dickson multiplication
-    /// Input x: [batch, n_embd] where n_embd = 8 * part_dim
-    /// Weight w: flattened [8, out_per_part, in_per_part] ternary values
+    /// Bitmask ternary matmul with octonion structure
+    /// Iterates only over non-zero positions using bitmask
+    /// Input x: [batch, in_dim] where in_dim = 8 * in_per_part
+    /// Weight w: BitmaskWeight with bitmask and sign_bits
     /// Output: [batch, out_dim] where out_dim = 8 * out_per_part
-    fn ternary_matmul(&self, x: &[f32], w: &TernaryWeight, batch: usize, in_dim: usize, out_dim: usize) -> Vec<f32> {
+    fn bitmask_matmul(&self, x: &[f32], w: &BitmaskWeight, batch: usize, in_dim: usize, out_dim: usize) -> Vec<f32> {
         // Sign table for Cayley-Dickson octonion multiplication
         const SIGN: [[i8; 8]; 8] = [
             [1, -1, -1, -1, -1, -1, -1, -1],
@@ -840,7 +804,8 @@ impl SpinNetModel {
             [1,  1,  1, -1, -1,  1,  1, -1],
             [1, -1,  1,  1, -1, -1,  1,  1],
         ];
-        const IDX: [[usize; 8]; 8] = [
+        // REV_IDX[out_part][w_part] = in_part such that IDX[out_part][in_part] == w_part
+        const REV_IDX: [[usize; 8]; 8] = [
             [0, 1, 2, 3, 4, 5, 6, 7],
             [1, 0, 3, 2, 5, 4, 7, 6],
             [2, 3, 0, 1, 6, 7, 4, 5],
@@ -853,48 +818,58 @@ impl SpinNetModel {
         
         let mut y = vec![0.0f32; batch * out_dim];
         
-        // Weight shape is [8, out_per_part, in_per_part]
         let in_per_part = in_dim / 8;
         let out_per_part = out_dim / 8;
+        let part_size = out_per_part * in_per_part;
         
-        // Check if weight data is valid for octonion structure
-        if w.data.len() < 8 * out_per_part * in_per_part {
-            // Fallback to simple matmul if weight structure doesn't match
-            return self.simple_matmul(x, w, batch, in_dim, out_dim);
-        }
+        // Iterate through bitmask to find non-zero positions
+        let mut sign_idx = 0usize;  // Index into sign_bits
         
-        for out_part in 0..8 {
-            for in_part in 0..8 {
-                let sign = SIGN[out_part][in_part] as f32;
-                let w_part = IDX[out_part][in_part]; // Weight chunk index
-                
-                // Pre-calculate indices to minimize inner loop overhead
-                let x_part_offset = in_part * in_per_part;
-                let y_part_offset = out_part * out_per_part;
-                let w_part_offset = w_part * out_per_part * in_per_part;
-                
-                // Iterate over weight matrix [out_per_part, in_per_part]
-                for o in 0..out_per_part {
-                    for i in 0..in_per_part {
-                        // Load weight ONCE
-                        let w_idx = w_part_offset + o * in_per_part + i;
-                        if w_idx >= w.data.len() { continue; }
-                        let w_val = w.data[w_idx] as f32;
+        for (byte_idx, &mask_byte) in w.bitmask.iter().enumerate() {
+            if mask_byte == 0 {
+                continue;  // Skip all-zero bytes
+            }
+            
+            // Check each bit in this byte
+            for bit in 0..8 {
+                if (mask_byte & (1 << bit)) != 0 {
+                    // Found a non-zero position
+                    let flat_idx = byte_idx * 8 + bit;
+                    
+                    // Get sign from sign_bits array
+                    let sign_byte_idx = sign_idx / 8;
+                    let sign_bit_idx = sign_idx % 8;
+                    let is_positive = if sign_byte_idx < w.sign_bits.len() {
+                        (w.sign_bits[sign_byte_idx] & (1 << sign_bit_idx)) != 0
+                    } else {
+                        true  // Default to +1
+                    };
+                    let base_sign = if is_positive { 1.0f32 } else { -1.0f32 };
+                    sign_idx += 1;
+                    
+                    // Decode 3D position: weight is [8, out_per_part, in_per_part]
+                    let w_part = flat_idx / part_size;
+                    let remainder = flat_idx % part_size;
+                    let o = remainder / in_per_part;
+                    let i = remainder % in_per_part;
+                    
+                    if w_part >= 8 || o >= out_per_part || i >= in_per_part {
+                        continue;
+                    }
+                    
+                    // Apply to all 8 output parts
+                    for out_part in 0..8 {
+                        let in_part = REV_IDX[out_part][w_part];
+                        let sign = (SIGN[out_part][in_part] as f32) * base_sign;
                         
-                        // Apply to ALL batch items
-                        // y[b][out_idx] += sign * x[b][in_idx] * w_val
-                        let x_inner_offset = x_part_offset + i;
-                        let y_inner_offset = y_part_offset + o;
+                        let x_offset = in_part * in_per_part + i;
+                        let y_offset = out_part * out_per_part + o;
                         
                         for b in 0..batch {
-                            let x_idx = b * in_dim + x_inner_offset;
-                            let y_idx = b * out_dim + y_inner_offset;
-                            
-                            // Unchecked access for speed (we know dims are correct)
-                            unsafe {
-                                let x_val = *x.get_unchecked(x_idx);
-                                let y_ptr = y.as_mut_ptr().add(y_idx);
-                                *y_ptr += sign * x_val * w_val;
+                            let x_idx = b * in_dim + x_offset;
+                            let y_idx = b * out_dim + y_offset;
+                            if x_idx < x.len() && y_idx < y.len() {
+                                y[y_idx] += sign * x[x_idx];
                             }
                         }
                     }
@@ -902,39 +877,19 @@ impl SpinNetModel {
             }
         }
         
-        // Apply beta scaling (batch-efficient)
-        // beta[o] applies to out index `o` (relative to part)
+        // Apply beta scaling - beta has length out_per_part, applies to all 8 output parts
         for out_part in 0..8 {
             for o in 0..out_per_part {
-                 let beta = w.beta.get(o).copied().unwrap_or(1.0);
-                 let y_inner_offset = out_part * out_per_part + o;
-                 
-                 for b in 0..batch {
-                     let y_idx = b * out_dim + y_inner_offset;
-                     unsafe {
-                         *y.get_unchecked_mut(y_idx) *= beta;
-                     }
-                 }
-            }
-        }
-        
-        y
-    }
-    
-    /// Simple matmul fallback for non-octonion weights
-    fn simple_matmul(&self, x: &[f32], w: &TernaryWeight, batch: usize, in_dim: usize, out_dim: usize) -> Vec<f32> {
-        let mut y = vec![0.0f32; batch * out_dim];
-        
-        for b in 0..batch {
-            for o in 0..out_dim {
-                let mut acc = 0.0f32;
-                for i in 0..in_dim {
-                    let w_idx = o * in_dim + i;
-                    if w_idx < w.data.len() {
-                        acc += x[b * in_dim + i] * (w.data[w_idx] as f32);
+                let beta = w.beta.get(o).copied().unwrap_or(1.0);
+                if beta != 1.0 {
+                    let y_inner_offset = out_part * out_per_part + o;
+                    for b in 0..batch {
+                        let y_idx = b * out_dim + y_inner_offset;
+                        if y_idx < y.len() {
+                            y[y_idx] *= beta;
+                        }
                     }
                 }
-                y[b * out_dim + o] = acc * w.beta.get(o).copied().unwrap_or(1.0);
             }
         }
         

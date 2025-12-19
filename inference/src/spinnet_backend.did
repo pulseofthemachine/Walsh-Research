@@ -8,11 +8,8 @@ service : {
     process_layers : (nat32) -> (text);
     finish_forward : () -> (text);
     "generate_next_token": () -> (text);
-    "start_session": (nat32, text, nat32) -> (text);
-    "generate_batch": (vec nat32) -> (vec text);
-    "start_forward_session": (nat32) -> (text);
-    "process_layers_session": (nat32, nat32) -> (text);
-    "finish_forward_session": (nat32) -> (text);
+    "generate_n_tokens": (nat32) -> (text);
+
     
     // Status and results
     get_result : () -> (text) query;

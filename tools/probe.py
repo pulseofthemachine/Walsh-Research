@@ -22,7 +22,7 @@ from src.model import SpinNetConfig, SpinNet
 # CONFIGURATION
 # -----------------------------------------------------------------------------
 # CHECKPOINT: Update this to point to the active run
-experiment_dir = 'out-crypto'    # The new 124M run
+experiment_dir = 'scholar_pilot'    # The new 124M run
 
 ckpt_path = os.path.join(parent_dir, 'experiments', experiment_dir, 'ckpt.pt')
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
