@@ -9,7 +9,6 @@ venv/
 *.pt
 *.pth
 *.ckpt
-*.spinnet
 experiments/
 out/
 
