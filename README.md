@@ -19,8 +19,6 @@ Standard LLMs treat dimensions as independent. We suspect that forcing dimension
 ## 🏗️ Architecture Components
 
 ### 1. Python Training Stack (`src/`)
-1. Python Training Stack (src/)
-
 Built on PyTorch. Use this to train models.
 
 - **Octonion Linear Layers**: Implements `y = x @ W^T` using the 8x8 Cayley-Dickson sign table.
