@@ -14,7 +14,7 @@ init_from = 'scratch'
 # Effective batch = 8 * 8 * 1024 = 65,536 tokens/step
 dataset = 'fineweb'
 gradient_accumulation_steps = 8
-batch_size = 8
+batch_size = 10 
 block_size = 1024
 
 # Model Architecture (124M params)
