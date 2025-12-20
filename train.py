@@ -142,8 +142,11 @@ best_val_loss = 1e9
 if init_from == 'scratch':
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 (50304)")
+    # Get octonion_attention from config if set, default to False
+    octonion_attention = config.get('octonion_attention', False)
     model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                      bias=bias, vocab_size=None, dropout=dropout)
+                      bias=bias, vocab_size=None, dropout=dropout, 
+                      octonion_attention=octonion_attention)
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = SpinNetConfig(**model_args)
     model = SpinNet(gptconf)
