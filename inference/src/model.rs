@@ -669,8 +669,8 @@ impl SpinNetModel {
         h
     }
     
-    /// Bitmask ternary matmul with octonion structure
-    /// Iterates only over non-zero positions using bitmask
+    /// Bitmask ternary matmul with octonion structure (OPTIMIZED)
+    /// Uses counter-based iteration to avoid expensive division operations.
     /// Input x: [batch, in_dim] where in_dim = 8 * in_per_part
     /// Weight w: BitmaskWeight with bitmask and sign_bits
     /// Output: [batch, out_dim] where out_dim = 8 * out_per_part
@@ -698,62 +698,101 @@ impl SpinNetModel {
             [7, 6, 5, 4, 3, 2, 1, 0],
         ];
         
-        let mut y = vec![0.0f32; batch * out_dim];
-        
+        // Pre-compute constants
         let in_per_part = in_dim / 8;
         let out_per_part = out_dim / 8;
-        let part_size = out_per_part * in_per_part;
+        let mut y = vec![0.0f32; batch * out_dim];
         
-        // Iterate through bitmask to find non-zero positions
-        let mut sign_idx = 0usize;  // Index into sign_bits
+        // State counters (avoid division/modulo inside loop)
+        let mut w_part = 0usize;
+        let mut o = 0usize;
+        let mut i = 0usize;
+        let mut sign_idx = 0usize;
         
-        for (byte_idx, &mask_byte) in w.bitmask.iter().enumerate() {
+        // Helper to advance counters by n positions
+        let advance_counters = |w_part: &mut usize, o: &mut usize, i: &mut usize, n: usize, in_per_part: usize, out_per_part: usize| {
+            *i += n;
+            while *i >= in_per_part {
+                *i -= in_per_part;
+                *o += 1;
+                if *o >= out_per_part {
+                    *o = 0;
+                    *w_part += 1;
+                }
+            }
+        };
+        
+        // Flattened loop with counter-based indexing
+        for &mask_byte in w.bitmask.iter() {
             if mask_byte == 0 {
-                continue;  // Skip all-zero bytes
+                // Optimization: Skip 8 positions at once
+                advance_counters(&mut w_part, &mut o, &mut i, 8, in_per_part, out_per_part);
+                continue;
             }
             
-            // Check each bit in this byte
-            for bit in 0..8 {
+            for bit in 0..8u8 {
                 if (mask_byte & (1 << bit)) != 0 {
-                    // Found a non-zero position
-                    let flat_idx = byte_idx * 8 + bit;
+                    // Bounds check
+                    if w_part >= 8 { break; }
                     
-                    // Get sign from sign_bits array
-                    let sign_byte_idx = sign_idx / 8;
-                    let sign_bit_idx = sign_idx % 8;
-                    let is_positive = if sign_byte_idx < w.sign_bits.len() {
-                        (w.sign_bits[sign_byte_idx] & (1 << sign_bit_idx)) != 0
-                    } else {
-                        true  // Default to +1
-                    };
+                    // --- HOT LOOP START ---
+                    
+                    // 1. Get Sign
+                    let sign_byte = w.sign_bits.get(sign_idx / 8).copied().unwrap_or(0xFF);
+                    let is_positive = (sign_byte & (1 << (sign_idx % 8))) != 0;
                     let base_sign = if is_positive { 1.0f32 } else { -1.0f32 };
                     sign_idx += 1;
                     
-                    // Decode 3D position: weight is [8, out_per_part, in_per_part]
-                    let w_part = flat_idx / part_size;
-                    let remainder = flat_idx % part_size;
-                    let o = remainder / in_per_part;
-                    let i = remainder % in_per_part;
+                    // 2. Octonion Permutation (Unrolled for all 8 output parts)
+                    // y[k][o] += sign_table[k][in_part] * x[in_part][i] * base_sign
                     
-                    if w_part >= 8 || o >= out_per_part || i >= in_per_part {
-                        continue;
-                    }
-                    
-                    // Apply to all 8 output parts
-                    for out_part in 0..8 {
-                        let in_part = REV_IDX[out_part][w_part];
-                        let sign = (SIGN[out_part][in_part] as f32) * base_sign;
-                        
-                        let x_offset = in_part * in_per_part + i;
-                        let y_offset = out_part * out_per_part + o;
-                        
-                        for b in 0..batch {
-                            let x_idx = b * in_dim + x_offset;
-                            let y_idx = b * out_dim + y_offset;
+                    if batch == 1 {
+                        // Fast path: batch=1 (common for inference)
+                        for k in 0..8 {
+                            let in_part = REV_IDX[k][w_part];
+                            let sign_val = SIGN[k][in_part] as f32;
+                            let combined_sign = sign_val * base_sign;
+                            
+                            let x_idx = in_part * in_per_part + i;
+                            let y_idx = k * out_per_part + o;
+                            
+                            // Safety: bounds are checked by w_part < 8, o < out_per_part, i < in_per_part
                             if x_idx < x.len() && y_idx < y.len() {
-                                y[y_idx] += sign * x[x_idx];
+                                unsafe {
+                                    *y.get_unchecked_mut(y_idx) += combined_sign * *x.get_unchecked(x_idx);
+                                }
                             }
                         }
+                    } else {
+                        // General case: batch > 1
+                        for k in 0..8 {
+                            let in_part = REV_IDX[k][w_part];
+                            let sign_val = SIGN[k][in_part] as f32;
+                            let combined_sign = sign_val * base_sign;
+                            
+                            let x_offset = in_part * in_per_part + i;
+                            let y_offset = k * out_per_part + o;
+                            
+                            for b in 0..batch {
+                                let x_idx = b * in_dim + x_offset;
+                                let y_idx = b * out_dim + y_offset;
+                                if x_idx < x.len() && y_idx < y.len() {
+                                    y[y_idx] += combined_sign * x[x_idx];
+                                }
+                            }
+                        }
+                    }
+                    // --- HOT LOOP END ---
+                }
+                
+                // Increment counters for each bit position
+                i += 1;
+                if i == in_per_part {
+                    i = 0;
+                    o += 1;
+                    if o == out_per_part {
+                        o = 0;
+                        w_part += 1;
                     }
                 }
             }
@@ -761,10 +800,10 @@ impl SpinNetModel {
         
         // Apply beta scaling - beta has length out_per_part, applies to all 8 output parts
         for out_part in 0..8 {
-            for o in 0..out_per_part {
-                let beta = w.beta.get(o).copied().unwrap_or(1.0);
+            for o_idx in 0..out_per_part {
+                let beta = w.beta.get(o_idx).copied().unwrap_or(1.0);
                 if beta != 1.0 {
-                    let y_inner_offset = out_part * out_per_part + o;
+                    let y_inner_offset = out_part * out_per_part + o_idx;
                     for b in 0..batch {
                         let y_idx = b * out_dim + y_inner_offset;
                         if y_idx < y.len() {

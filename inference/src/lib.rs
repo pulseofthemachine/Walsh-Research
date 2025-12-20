@@ -29,6 +29,9 @@ struct ForwardState {
     new_len: usize,        // Number of new positions (1 after prompt)
     phase: ForwardPhase,
     kv_cache: Option<KVCache>,  // KV cache for efficient generation
+    // Scratchpad buffers (avoid allocations in hot loops)
+    scratch_norm: Vec<f32>,     // For normalized hidden states
+    scratch_ffn: Vec<f32>,      // For FFN intermediate activations
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -145,6 +148,8 @@ fn start_forward() -> String {
                                         new_len: 1,  // Just the new token
                                         phase: ForwardPhase::Layers,
                                         kv_cache: Some(cache),
+                                        scratch_norm: Vec::new(),
+                                        scratch_ffn: Vec::new(),
                                     });
                                     
                                     format!("Forward: cached, new_len=1")
@@ -161,6 +166,8 @@ fn start_forward() -> String {
                                         new_len: seq_len,  // All tokens are new
                                         phase: ForwardPhase::Layers,
                                         kv_cache: Some(cache),
+                                        scratch_norm: Vec::with_capacity(seq_len * model.config.n_embd),
+                                        scratch_ffn: Vec::with_capacity(seq_len * model.config.n_embd * 4),
                                     });
                                     
                                     format!("Forward: init, seq_len={}", seq_len)
@@ -178,8 +185,13 @@ fn start_forward() -> String {
 }
 
 /// Process multiple transformer layers (uses KV cache when available)
+/// Includes adaptive instruction monitoring to prevent exceeding ICP limits
 #[update]
 fn process_layers(count: u32) -> String {
+    // Adaptive chunking: monitor instruction usage
+    const MAX_INSTRUCTIONS: u64 = 2_000_000_000;  // Safe threshold (ICP limit is higher)
+    let start_counter = ic_cdk::api::performance_counter(0);
+    
     let result = MODEL.with(|m| {
         let model_ref = m.borrow();
         match model_ref.as_ref() {
@@ -192,7 +204,7 @@ fn process_layers(count: u32) -> String {
                                 return format!("Not in layer phase (phase: {:?})", state.phase);
                             }
                             
-                            let mut processed = 0;
+                            let mut processed = 0u32;
                             
                             // Use cached execution if we have a cache
                             if let Some(ref mut cache) = state.kv_cache {
@@ -200,6 +212,15 @@ fn process_layers(count: u32) -> String {
                                     if state.layer_idx >= model.config.n_layer {
                                         state.phase = ForwardPhase::FinalNorm;
                                         break;
+                                    }
+                                    
+                                    // Adaptive: Check instruction usage before processing next layer
+                                    let used = ic_cdk::api::performance_counter(0) - start_counter;
+                                    if used > MAX_INSTRUCTIONS * 80 / 100 {
+                                        // Approaching limit, pause and let caller retry
+                                        return format!("Paused at layer {} ({}% budget)", 
+                                            state.layer_idx, 
+                                            used * 100 / MAX_INSTRUCTIONS);
                                     }
                                     
                                     // Process layer with cache
@@ -226,6 +247,15 @@ fn process_layers(count: u32) -> String {
                                         state.phase = ForwardPhase::FinalNorm;
                                         break;
                                     }
+                                    
+                                    // Adaptive: Check instruction usage
+                                    let used = ic_cdk::api::performance_counter(0) - start_counter;
+                                    if used > MAX_INSTRUCTIONS * 80 / 100 {
+                                        return format!("Paused at layer {} ({}% budget)", 
+                                            state.layer_idx, 
+                                            used * 100 / MAX_INSTRUCTIONS);
+                                    }
+                                    
                                     let new_hidden = model.run_layer(state.layer_idx, &state.hidden, state.seq_len);
                                     state.hidden = new_hidden;
                                     state.layer_idx += 1;
@@ -347,6 +377,8 @@ fn generate_next_token() -> String {
                                         new_len: 0,
                                         phase: ForwardPhase::Done,
                                         kv_cache: Some(cache),
+                                        scratch_norm: Vec::new(),
+                                        scratch_ffn: Vec::new(),
                                     });
                                 });
                                 
@@ -422,6 +454,8 @@ fn generate_n_tokens(n: u32) -> String {
                                         new_len: 0,
                                         phase: ForwardPhase::Done,
                                         kv_cache: Some(cache),
+                                        scratch_norm: Vec::new(),
+                                        scratch_ffn: Vec::new(),
                                     });
                                 });
                                 
