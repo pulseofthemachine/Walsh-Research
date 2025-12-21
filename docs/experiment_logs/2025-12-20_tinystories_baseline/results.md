@@ -1,5 +1,5 @@
 # TinyStories Training Results
-**Date:** 2024-12-20
+**Date:** 2025-12-20
 
 ## Experiment Summary
 Training SpinNet on TinyStories dataset (token-level, GPT-2 tokenizer).

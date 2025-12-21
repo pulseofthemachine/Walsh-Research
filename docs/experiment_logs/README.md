@@ -17,8 +17,8 @@ experiment_logs/
 
 | Date | Name | Key Finding |
 |------|------|-------------|
-| 2024-12-20 | [TinyStories Baseline](./2024-12-20_tinystories_baseline/) | Val loss 2.68, dimension specialization discovered |
-| 2024-12-20 | [Octonion Attention A/B](./2024-12-20_octonion_attention_ab/) | 8% loss improvement on code with head mixer |
+| 2025-12-20 | [TinyStories Baseline](./2025-12-20_tinystories_baseline/) | Val loss 2.68, dimension specialization discovered |
+| 2025-12-20 | [Octonion Attention A/B](./2025-12-20_octonion_attention_ab/) | 8% loss improvement on code with head mixer |
 
 ## Other
 - [Future Ideas](./future_ideas.md) - Research backlog and hypotheses
