@@ -7,9 +7,8 @@ service : {
     start_forward : () -> (text);
     process_layers : (nat32) -> (text);
     finish_forward : () -> (text);
-    "generate_next_token": () -> (text);
-    "generate_n_tokens": (nat32) -> (text);
-
+    generate_next_token : () -> (text);
+    generate_n_tokens : (nat32) -> (text);
     
     // Status and results
     get_result : () -> (text) query;

@@ -2,8 +2,7 @@
 //!
 //! Full implementation with weight parsing and transformer forward pass.
 
-use crate::attention::{rms_norm, attention, attention_cached, apply_rope, silu};
-use crate::octonion::{SIGN_TABLE, WEIGHT_IDX};
+use crate::attention::{rms_norm, attention, attention_cached, silu};
 use crate::tokenizer::Tokenizer;
 
 /// SpinNet model container
@@ -1171,8 +1170,8 @@ fn argmax(arr: &[f32]) -> usize {
         .unwrap_or(0)
 }
 
-/// Simple LCG random number generator (deterministic seeded RNG for ICP)
-/// Uses the MINSTD parameters
+// Simple LCG random number generator (deterministic seeded RNG for ICP)
+// Uses the MINSTD parameters
 thread_local! {
     static RNG_STATE: std::cell::RefCell<u64> = std::cell::RefCell::new(12345);
 }

@@ -2,34 +2,6 @@
 //!
 //! Implements scaled dot-product attention with causal masking.
 
-/// Apply RoPE (Rotary Position Embedding)
-pub fn apply_rope(
-    q: &mut [f32],  // [seq_len, head_dim]
-    k: &mut [f32],
-    freqs: &[(f32, f32)],  // (cos, sin) pairs for each position
-    head_dim: usize,
-) {
-    let seq_len = q.len() / head_dim;
-    
-    for pos in 0..seq_len {
-        for i in 0..(head_dim / 2) {
-            let (cos, sin) = freqs[pos * (head_dim / 2) + i];
-            
-            let q_idx = pos * head_dim + i * 2;
-            let q0 = q[q_idx];
-            let q1 = q[q_idx + 1];
-            q[q_idx] = q0 * cos - q1 * sin;
-            q[q_idx + 1] = q0 * sin + q1 * cos;
-            
-            let k_idx = pos * head_dim + i * 2;
-            let k0 = k[k_idx];
-            let k1 = k[k_idx + 1];
-            k[k_idx] = k0 * cos - k1 * sin;
-            k[k_idx + 1] = k0 * sin + k1 * cos;
-        }
-    }
-}
-
 /// Scaled dot-product attention with causal mask
 pub fn attention(
     q: &[f32],  // [seq_len, n_head, head_dim]

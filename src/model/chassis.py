@@ -7,6 +7,7 @@ from torch.utils.checkpoint import checkpoint
 # Use original for training (fused backward is slow)
 # For inference, see cayley_dickson_cuda.py
 from .physics import OctonionTernaryLinear
+from .ssm import OctonionSSM
 
 # Use fused head mixer on CUDA, pure PyTorch otherwise
 _USE_FUSED_HEAD_MIXER = torch.cuda.is_available()
@@ -26,6 +27,7 @@ class SpinNetConfig:
     dropout: float = 0.0
     bias: bool = False
     octonion_attention: bool = False  # Enable octonion head mixing
+    use_ssm: bool = False  # Use SSM instead of attention (infinite context)
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -206,15 +208,42 @@ class SwiGLUMLP(nn.Module):
 class LlamaBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.use_ssm = config.use_ssm
         self.attention_norm = RMSNorm(config.n_embd)
-        self.attention = CausalSelfAttention(config)
+        
+        if self.use_ssm:
+            # SSM mode: no attention, just state space dynamics
+            self.ssm = OctonionSSM(config.n_embd)
+        else:
+            # Attention mode: standard causal self-attention
+            self.attention = CausalSelfAttention(config)
+            
         self.ffn_norm = RMSNorm(config.n_embd)
         self.feed_forward = SwiGLUMLP(config)
 
-    def forward(self, x, freqs_cis):
-        h = x + self.attention(self.attention_norm(x), freqs_cis)
+    def forward(self, x, freqs_cis=None, h_prev=None):
+        """
+        Forward pass.
+        
+        For attention mode: uses freqs_cis for RoPE, ignores h_prev
+        For SSM mode: uses h_prev for state, ignores freqs_cis
+        
+        Returns:
+            out: output tensor
+            h_new: new hidden state (SSM mode only, None for attention)
+        """
+        h_new = None
+        
+        if self.use_ssm:
+            # SSM path
+            ssm_out, h_new = self.ssm(self.attention_norm(x), h_prev)
+            h = x + ssm_out
+        else:
+            # Attention path  
+            h = x + self.attention(self.attention_norm(x), freqs_cis)
+            
         out = h + self.feed_forward(self.ffn_norm(h))
-        return out
+        return out, h_new
 
 class SpinNet(nn.Module):
     def __init__(self, config):
@@ -238,19 +267,43 @@ class SpinNet(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, h_states=None):
+        """
+        Forward pass.
+        
+        Args:
+            idx: [B, T] token indices
+            targets: [B, T] target indices for loss computation
+            h_states: list of [B, D] hidden states per layer (SSM mode only)
+            
+        Returns:
+            logits: [B, T, vocab_size] or [B, 1, vocab_size]
+            loss: scalar loss if targets provided
+            h_states_new: list of new hidden states (SSM mode only)
+        """
         B, T = idx.shape
         h = self.tok_embeddings(idx)
-        freqs_cis = self.freqs_cis[:T]
-
-        # --- MODIFIED: Gradient Checkpointing ---
-        for layer in self.layers:
-            if self.training:
-                # We save VRAM by not storing activations, re-computing them during backward pass.
-                # use_reentrant=False is the modern, stable standard.
-                h = checkpoint(layer, h, freqs_cis, use_reentrant=False)
+        freqs_cis = self.freqs_cis[:T] if not self.config.use_ssm else None
+        
+        # Initialize hidden states for SSM mode
+        if self.config.use_ssm and h_states is None:
+            h_states = [None] * len(self.layers)
+        
+        h_states_new = []
+        
+        # --- Layer forward (with gradient checkpointing for attention) ---
+        for i, layer in enumerate(self.layers):
+            h_prev = h_states[i] if self.config.use_ssm else None
+            
+            if self.training and not self.config.use_ssm:
+                # Gradient checkpointing for attention mode only
+                # SSM has different memory patterns, checkpointing less useful
+                h, h_new = checkpoint(layer, h, freqs_cis, None, use_reentrant=False)
             else:
-                h = layer(h, freqs_cis)
+                h, h_new = layer(h, freqs_cis, h_prev)
+            
+            if self.config.use_ssm:
+                h_states_new.append(h_new)
         # ----------------------------------------
 
         h = self.norm(h)
@@ -260,13 +313,33 @@ class SpinNet(nn.Module):
         else:
             logits = self.output(h[:, [-1], :])
             loss = None
+        
+        # Return hidden states for SSM mode (for stateful generation)
+        if self.config.use_ssm:
+            return logits, loss, h_states_new
         return logits, loss
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Generate tokens autoregressively.
+        
+        For attention mode: Uses sliding window, recomputes attention each step.
+        For SSM mode: Maintains hidden state, O(1) per token.
+        """
+        h_states = None  # SSM hidden states
+        
         for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            logits, _ = self(idx_cond)
+            if self.config.use_ssm:
+                # SSM mode: process one token at a time with state
+                idx_input = idx[:, -1:]  # Just the last token
+                result = self(idx_input, h_states=h_states)
+                logits, _, h_states = result
+            else:
+                # Attention mode: sliding window
+                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+                logits, _ = self(idx_cond)
+            
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))

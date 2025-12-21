@@ -2,12 +2,14 @@
 //!
 //! Implements layer-by-layer chunked execution with singleton state.
 
+// Allow unused code for scaffolding/future use
+#![allow(dead_code, unused_variables, unused_mut)]
+
 mod model;
 mod octonion;
 mod attention;
 mod tokenizer;
 
-use candid::{CandidType, Deserialize};
 use ic_cdk_macros::{init, post_upgrade, query, update};
 use std::cell::RefCell;
 
