@@ -1,3 +1,11 @@
+"""
+SpinNet Physics Layer
+---------------------
+Ternary quantization and reference Octonion linear layer.
+
+The OctonionTernaryLinear exported from this module uses CUDA-optimized
+kernels when available, falling back to the reference implementation.
+"""
 import torch
 import torch.nn as nn
 

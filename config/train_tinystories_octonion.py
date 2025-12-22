@@ -26,7 +26,7 @@ bias = False
 
 # Optimizer
 learning_rate = 6e-3  # Slightly lower for token-level
-max_iters = 10000
+max_iters = 25000
 weight_decay = 0.1  # Standard for token-level training
 beta1 = 0.9
 beta2 = 0.95
@@ -35,8 +35,8 @@ grad_clip = 1.0
 # LR Schedule
 decay_lr = True
 warmup_iters = 200
-lr_decay_iters = 10000
-min_lr = 6e-4
+lr_decay_iters = 25000
+min_lr = 1e-4
 
 # Hardware
 device = 'cuda'

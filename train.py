@@ -1,6 +1,7 @@
 """
-SpinNet Training Engine (Phase 11.5 Stable)
-Optimized for Ternary-Octonion Architectures
+SpinNet Training Script
+-----------------------
+Training loop for Octonion-Ternary Transformer models.
 """
 import os
 import time
@@ -35,7 +36,7 @@ n_head = 12
 n_embd = 768
 dropout = 0.0
 bias = False 
-octonion_attention = False  # Enable octonion head mixing
+octonion_attention = True  # Enable octonion head mixing
 
 # AdamW
 learning_rate = 6e-4 
@@ -185,29 +186,49 @@ model.to(device)
 # COMMAND CENTER: METRICS REPORT
 # -----------------------------------------------------------------------------
 print("-" * 60)
-print(">>> SPINNET SCHOLAR: LAUNCH SEQUENCE <<<")
+print(">>> SPINNET: LAUNCH SEQUENCE <<<")
 print("-" * 60)
 
 # Parameter Count
 n_params = sum(p.numel() for p in model.parameters())
 n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"MODEL SPECS:")
-print(f"  Params       : {n_params/1e6:.2f}M (Total) | {n_trainable/1e6:.2f}M (Trainable)")
-print(f"  Layers       : {n_layer}")
-print(f"  Heads        : {n_head} (Head Dim: {n_embd//n_head})")
-print(f"  Embedding    : {n_embd}")
-print(f"  Context      : {block_size}")
-print(f"  Octonion     : {'Enabled' if n_embd % 8 == 0 else 'WARNING: n_embd not divisible by 8!'}")
 
-# MFU Estimate
-flops_per_token = 6 * n_params
-flops_per_fwdbwd = flops_per_token * block_size
-flops_per_iter = flops_per_fwdbwd * gradient_accumulation_steps * batch_size
+# Compute actual batch sizes and tokens
+effective_batch = gradient_accumulation_steps * batch_size
+tokens_per_iter = effective_batch * block_size
+
+# Dataset size info
+train_tokens = len(train_data) if train_data is not None else 0
+val_tokens = len(val_data) if val_data is not None else 0
+iters_per_epoch = train_tokens // tokens_per_iter if tokens_per_iter > 0 else 0
+
+print(f"MODEL:")
+print(f"  Params       : {n_params/1e6:.2f}M total ({n_trainable/1e6:.2f}M trainable)")
+print(f"  Architecture : {n_layer} layers, {n_head} heads, {n_embd//8} dim × 8 octonion")
+print(f"  Context      : {block_size} tokens")
+print(f"  Octonion Attn: {'Enabled' if config.get('octonion_attention', False) else 'Disabled'}")
+
+print(f"DATA:")
+print(f"  Dataset      : {dataset}")
+print(f"  Train Tokens : {train_tokens/1e6:.1f}M")
+print(f"  Val Tokens   : {val_tokens/1e6:.1f}M")
+
+print(f"TRAINING:")
+print(f"  Batch Size   : {batch_size} x {gradient_accumulation_steps} = {effective_batch} effective")
+print(f"  Tokens/Iter  : {tokens_per_iter:,}")
+print(f"  Iters/Epoch  : ~{iters_per_epoch:,}")
+print(f"  Max Iters    : {max_iters:,}")
+print(f"  Est. Epochs  : ~{max_iters / iters_per_epoch:.1f}" if iters_per_epoch > 0 else "  Est. Epochs  : N/A")
+
 print(f"COMPUTE:")
-print(f"  Est. FLOPs/it: {flops_per_iter:.2e}")
+flops_per_token = 6 * n_params
+flops_per_iter = flops_per_token * tokens_per_iter
+print(f"  FLOPs/Iter   : {flops_per_iter:.2e}")
 print(f"  Device       : {device} ({dtype})")
+print(f"  Compile      : {'Enabled' if compile else 'Disabled'}")
 
 print("-" * 60)
+
 
 # -----------------------------------------------------------------------------
 # OPTIMIZER
@@ -234,9 +255,9 @@ if compile:
 # -----------------------------------------------------------------------------
 @torch.no_grad()
 def estimate_loss():
+    """Evaluate train/val loss over eval_iters batches."""
     out = {}
     model.eval()
-    # WE ARE IN EAGER MODE NOW, SO WE REMOVE THE COMPILER DISABLE BLOCK
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):

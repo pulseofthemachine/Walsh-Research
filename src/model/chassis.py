@@ -65,40 +65,19 @@ class OctonionHeadMixer(nn.Module):
     Input: [B, 8, T, head_dim] (8 heads)
     Output: [B, 8, T, head_dim] (mixed heads)
     """
-    # Cayley-Dickson sign table (same as physics.py)
-    SIGNS = [
-        [+1, -1, -1, -1, -1, -1, -1, -1],  # y0
-        [+1, +1, +1, -1, +1, -1, -1, +1],  # y1
-        [+1, -1, +1, +1, +1, +1, -1, -1],  # y2
-        [+1, +1, -1, +1, +1, -1, +1, -1],  # y3
-        [+1, -1, -1, -1, +1, +1, +1, +1],  # y4
-        [+1, +1, -1, +1, -1, +1, -1, +1],  # y5
-        [+1, +1, +1, -1, -1, +1, +1, -1],  # y6
-        [+1, -1, +1, +1, -1, -1, +1, +1],  # y7
-    ]
-    
-    # Weight index table
-    WIDX = [
-        [0, 1, 2, 3, 4, 5, 6, 7],  # y0
-        [1, 0, 3, 2, 5, 4, 7, 6],  # y1
-        [2, 3, 0, 1, 6, 7, 4, 5],  # y2
-        [3, 2, 1, 0, 7, 6, 5, 4],  # y3
-        [4, 5, 6, 7, 0, 1, 2, 3],  # y4
-        [5, 4, 7, 6, 1, 0, 3, 2],  # y5
-        [6, 7, 4, 5, 2, 3, 0, 1],  # y6
-        [7, 6, 5, 4, 3, 2, 1, 0],  # y7
-    ]
     
     def __init__(self, head_dim):
         super().__init__()
+        from .constants import SIGN_TABLE, WEIGHT_IDX
+        
         self.head_dim = head_dim
         # Learnable mixing weights: 8 weight matrices [head_dim, head_dim]
         self.W = nn.Parameter(torch.randn(8, head_dim, head_dim) * 0.02)
         self.beta = nn.Parameter(torch.ones(head_dim) * 0.1)
         
         # Pre-register sign and widx tables as buffers
-        self.register_buffer('signs', torch.tensor(self.SIGNS, dtype=torch.float32))
-        self.register_buffer('widx', torch.tensor(self.WIDX, dtype=torch.long))
+        self.register_buffer('signs', torch.tensor(SIGN_TABLE, dtype=torch.float32))
+        self.register_buffer('widx', torch.tensor(WEIGHT_IDX, dtype=torch.long))
     
     def forward(self, x):
         """
