@@ -1,5 +1,6 @@
 import math
 from dataclasses import dataclass
+from typing import Optional, Tuple, List
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -38,6 +39,77 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         return self._norm(x.float()).type_as(x) * self.weight
+
+
+class KVCache:
+    """
+    KV Cache for efficient autoregressive generation.
+    
+    Stores K and V tensors per layer to avoid recomputation during generation.
+    Only used for inference (generate method), not training.
+    """
+    
+    def __init__(self, n_layers: int, max_seq_len: int, n_head: int, head_dim: int, 
+                 device: torch.device, dtype: torch.dtype = torch.bfloat16):
+        """
+        Args:
+            n_layers: Number of transformer layers
+            max_seq_len: Maximum sequence length (block_size)
+            n_head: Number of attention heads
+            head_dim: Dimension per head (n_embd // n_head)
+            device: Device to allocate tensors on
+            dtype: Data type for cache tensors
+        """
+        self.n_layers = n_layers
+        self.max_seq_len = max_seq_len
+        self.n_head = n_head
+        self.head_dim = head_dim
+        
+        # Pre-allocate cache tensors: [max_seq_len, n_head, head_dim] per layer
+        # Using list instead of stacking for easier per-layer updates
+        self.k_cache: List[torch.Tensor] = [
+            torch.zeros(max_seq_len, n_head, head_dim, device=device, dtype=dtype)
+            for _ in range(n_layers)
+        ]
+        self.v_cache: List[torch.Tensor] = [
+            torch.zeros(max_seq_len, n_head, head_dim, device=device, dtype=dtype)
+            for _ in range(n_layers)
+        ]
+        self.cached_len = 0
+    
+    def update(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Update cache with new K, V and return full K, V for attention.
+        
+        Args:
+            layer_idx: Which layer's cache to update
+            k: New key tensor [batch, new_len, n_head, head_dim]
+            v: New value tensor [batch, new_len, n_head, head_dim]
+            
+        Returns:
+            (k_full, v_full): Full K/V including cache [batch, total_len, n_head, head_dim]
+        """
+        batch, new_len, n_head, head_dim = k.shape
+        
+        # Store new K, V in cache (squeeze batch dim since batch=1 for generation)
+        start_pos = self.cached_len
+        end_pos = start_pos + new_len
+        self.k_cache[layer_idx][start_pos:end_pos] = k[0]  # [new_len, n_head, head_dim]
+        self.v_cache[layer_idx][start_pos:end_pos] = v[0]
+        
+        # Return full K, V up to current position (add batch dim back)
+        k_full = self.k_cache[layer_idx][:end_pos].unsqueeze(0)  # [1, total_len, n_head, head_dim]
+        v_full = self.v_cache[layer_idx][:end_pos].unsqueeze(0)
+        
+        return k_full, v_full
+    
+    def increment(self, n: int = 1):
+        """Increment cached length after processing new tokens."""
+        self.cached_len += n
+    
+    def reset(self):
+        """Reset cache for new generation session."""
+        self.cached_len = 0
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -128,7 +200,7 @@ class CausalSelfAttention(nn.Module):
             else:
                 self.head_mixer = OctonionHeadMixer(self.head_dim)
 
-    def forward(self, x, freqs_cis):
+    def forward(self, x, freqs_cis, kv_cache: Optional[KVCache] = None, layer_idx: int = 0):
         B, T, C = x.size()
         x_parts = x.split(C // 8, dim=-1)
         q_parts = self.wq(x_parts)
@@ -139,10 +211,38 @@ class CausalSelfAttention(nn.Module):
         k = torch.cat(k_parts, dim=-1).view(B, T, self.n_head, self.head_dim)
         v = torch.cat(v_parts, dim=-1).view(B, T, self.n_head, self.head_dim)
         
+        # Apply RoPE
         q, k = apply_rotary_emb(q, k, freqs_cis)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0)
+        # KV Cache: store new K,V and retrieve full sequence
+        if kv_cache is not None:
+            k, v = kv_cache.update(layer_idx, k, v)
+            # k, v now have shape [B, cached_len + T, n_head, head_dim]
+        
+        # Transpose for attention: [B, n_head, seq_len, head_dim]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # When using cache, we still need causal mask for the query positions
+        # but with respect to all cached + new positions
+        # is_causal=True only works when q_len == k_len, so use manual mask when cached
+        if kv_cache is not None and kv_cache.cached_len > 0:
+            # New tokens can attend to all cached tokens plus themselves (causally)
+            # q: [B, n_head, T, head_dim], k: [B, n_head, cached_len + T, head_dim]
+            total_len = k.size(2)
+            # Build causal mask: each query position can see all previous + itself
+            # Query position i (relative to cached_len) can see positions 0..cached_len+i
+            causal_mask = torch.ones(T, total_len, dtype=torch.bool, device=q.device).tril(diagonal=total_len - T)
+            y = F.scaled_dot_product_attention(
+                q, k, v, 
+                attn_mask=causal_mask,
+                dropout_p=self.dropout if self.training else 0
+            )
+        else:
+            # No cache or first forward: use standard causal attention
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0)
+        
         # y: [B, n_head, T, head_dim]
         
         # Octonion mixing across heads
@@ -190,8 +290,8 @@ class LlamaBlock(nn.Module):
         self.ffn_norm = RMSNorm(config.n_embd)
         self.feed_forward = SwiGLUMLP(config)
 
-    def forward(self, x, freqs_cis):
-        h = x + self.attention(self.attention_norm(x), freqs_cis)
+    def forward(self, x, freqs_cis, kv_cache: Optional[KVCache] = None, layer_idx: int = 0):
+        h = x + self.attention(self.attention_norm(x), freqs_cis, kv_cache=kv_cache, layer_idx=layer_idx)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -217,16 +317,18 @@ class SpinNet(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, kv_cache: Optional[KVCache] = None, start_pos: int = 0):
         B, T = idx.shape
         h = self.tok_embeddings(idx)
-        freqs_cis = self.freqs_cis[:T]
         
-        for layer in self.layers:
+        # Get RoPE frequencies for current positions
+        freqs_cis = self.freqs_cis[start_pos:start_pos + T]
+        
+        for layer_idx, layer in enumerate(self.layers):
             if self.training:
                 h = checkpoint(layer, h, freqs_cis, use_reentrant=False)
             else:
-                h = layer(h, freqs_cis)
+                h = layer(h, freqs_cis, kv_cache=kv_cache, layer_idx=layer_idx)
 
         h = self.norm(h)
         if targets is not None:
@@ -239,10 +341,36 @@ class SpinNet(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            logits, _ = self(idx_cond)
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_cache=True):
+        """
+        Generate tokens autoregressively.
+        
+        Args:
+            idx: Input token indices [B, T]
+            max_new_tokens: Number of tokens to generate
+            temperature: Sampling temperature (lower = more focused)
+            top_k: Top-k sampling (None = disabled)
+            use_cache: Whether to use KV cache for efficient generation
+        """
+        device = idx.device
+        B, T = idx.shape
+        
+        # Initialize KV cache if using cached generation
+        if use_cache:
+            kv_cache = KVCache(
+                n_layers=self.config.n_layer,
+                max_seq_len=self.config.block_size,
+                n_head=self.config.n_head,
+                head_dim=self.config.n_embd // self.config.n_head,
+                device=device,
+                dtype=next(self.parameters()).dtype
+            )
+            
+            # Process prompt through all layers (fills the cache)
+            logits, _ = self(idx, kv_cache=kv_cache, start_pos=0)
+            kv_cache.increment(T)
+            
+            # Sample first new token
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -250,4 +378,34 @@ class SpinNet(nn.Module):
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
+            
+            # Generate remaining tokens one at a time using cache
+            for i in range(1, max_new_tokens):
+                if kv_cache.cached_len >= self.config.block_size:
+                    break
+                
+                # Only forward the new token
+                logits, _ = self(idx_next, kv_cache=kv_cache, start_pos=kv_cache.cached_len)
+                kv_cache.increment(1)
+                
+                logits = logits[:, -1, :] / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+                idx = torch.cat((idx, idx_next), dim=1)
+        else:
+            # Original non-cached generation (for comparison/fallback)
+            for _ in range(max_new_tokens):
+                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+                logits, _ = self(idx_cond)
+                logits = logits[:, -1, :] / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+                idx = torch.cat((idx, idx_next), dim=1)
+        
         return idx
