@@ -70,7 +70,7 @@ A bare-metal inference engine designed for the **DFINITY Internet Computer (IC)*
 - **Weights**: Parses custom `.spinnet` sparse-ternary format with Octonion Head Mixer support.
 - **Tokenizer**: Auto-detecting (char-level for vocab≤256, GPT-2 BPE otherwise).
 - **Head Mixer**: Full Cayley-Dickson algebra implementation for attention mixing.
-- **KV Cache**: Incremental attention (O(1) complexity per token).
+- **KV Cache**: Incremental attention (O(1) complexity per token) — also in Python!
 - **Temperature Sampling**: Softmax with T=0.8 for diverse generation.
 - **Adaptive Chunking**: Automatically pauses at 60% instruction budget.
 
@@ -121,12 +121,15 @@ A bare-metal inference engine designed for the **DFINITY Internet Computer (IC)*
 ### Verified Working
 - ✅ **Coherent Text Generation**: TinyStories produces children's story text
 - ✅ **Octonion Head Mixer**: Reduces loss by ~8% vs baseline
+- ✅ **KV Cache (Python)**: 4.6x speedup, 36+ tok/s generation
+- ✅ **Model Compression**: 13x smaller files, 3.7x less GPU memory
 - ✅ **ICP Deployment**: ~0.7 tok/s on local replica
 
 ### Recent Improvements
-- **GPT-2 Tokenizer**: Rust inference now supports 50k vocab models
-- **Head Mixer in Rust**: Full Cayley-Dickson implementation matching Python
-- **Temperature Sampling**: More diverse output (no more greedy loops)
+- **KV Cache in Python**: Incremental decoding for fast inference
+- **Compression Pipeline**: Bitmask ternary format with 90% sparsity
+- **GPT-2 Tokenizer**: Both Rust and Python support 50k vocab models
+- **Head Mixer**: Full Cayley-Dickson implementation in Python + Rust
 
 ---
 
@@ -149,10 +152,19 @@ A bare-metal inference engine designed for the **DFINITY Internet Computer (IC)*
 ---
 
 ## 📂 Key Files
-- `src/model/cayley_dickson_cuda.py`: High-performance CUDA kernels (linear + head mixer)
-- `src/model/chassis.py`: Model architecture with Octonion Head Mixer
-- `inference/src/model.rs`: Rust Wasm inference with head mixer
+
+### Python Training & Inference
+- `src/model/chassis.py`: Model architecture with KV Cache and Octonion Head Mixer
+- `src/model/cayley_dickson_cuda.py`: High-performance Triton kernels
+- `train.py`: Training script with gradient checkpointing
+- `generate.py`: Generate from `.pt` checkpoints
+- `generate_compressed.py`: Generate from `.spinnet` files
+- `compress.py`: Convert `.pt` → `.spinnet` format
+
+### Rust/Wasm Inference
+- `inference/src/model.rs`: Rust inference with KV cache and head mixer
 - `inference/src/tokenizer.rs`: Auto-detecting GPT-2/char tokenizer
-- `inference/src/lib.rs`: IC Canister API (Session Manager)
-- `compress.py`: Convert PyTorch `.pt` -> `.spinnet` format
-- `tools/analyze_octonion.py`: Analyze dimension specialization
+- `inference/src/lib.rs`: IC Canister API
+
+### Docs
+- `COMPRESSION_GUIDE.md`: Detailed compression workflow and API
