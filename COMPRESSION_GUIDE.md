@@ -2,6 +2,8 @@
 
 This guide covers how to compress SpinNet models for efficient storage and deployment using a TinyStories-trained model as an example.
 
+CURRENTLY SUPPORTS OCTONION (8D) ONLY
+
 ## Overview
 
 The compression pipeline converts PyTorch checkpoints (`.pt`) to optimized `.spinnet` format:
