@@ -40,6 +40,7 @@ class SpinNetConfig:
     bias: bool = False
     head_mixing: bool = False  # Enable algebra-based head mixing (auto-detects type)
     algebra: str = "octonion"  # "octonion" (8D) or "hadamard" (32D)
+    hash_embeddings: bool = False  # Use composite hash embeddings (25x compression)
 
 
 def get_linear_layer(config: SpinNetConfig):
@@ -95,6 +96,140 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         return self._norm(x.float()).type_as(x) * self.weight
+
+
+class HashEmbedding(nn.Module):
+    """
+    Composite Hash Embeddings for extreme parameter compression.
+    
+    Instead of one large table (vocab_size × n_embd), uses two small tables
+    with prime bucket sizes. Token embeddings are the sum of lookups from both.
+    
+    For 50k vocab, 512 dim:
+    - Standard: 50,000 × 512 = 25.6M params
+    - Hash (bucket=1021): 1021 × 512 × 2 = 1.04M params (25x compression)
+    
+    Also provides output_projection() to compute logits using the same hash trick,
+    enabling weight tying without a full vocab×n_embd output matrix.
+    """
+    
+    def __init__(self, vocab_size: int, n_embd: int, bucket_size: int = 1021):
+        super().__init__()
+        # Use prime bucket size to minimize collision patterns
+        self.bucket_size = bucket_size
+        self.vocab_size = vocab_size
+        self.n_embd = n_embd
+        
+        # Two small embedding tables
+        self.emb_1 = nn.Embedding(bucket_size, n_embd)
+        self.emb_2 = nn.Embedding(bucket_size, n_embd)
+        
+        # Initialize with variance scaling (sum of two → scale by 1/sqrt(2))
+        nn.init.normal_(self.emb_1.weight, std=0.02 / math.sqrt(2))
+        nn.init.normal_(self.emb_2.weight, std=0.02 / math.sqrt(2))
+        
+        # Precompute hash indices for all vocab tokens
+        vocab_indices = torch.arange(vocab_size)
+        self.register_buffer('h1_all', vocab_indices % bucket_size)
+        self.register_buffer('h2_all', (vocab_indices // bucket_size) % bucket_size)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Hash trick: separate high and low bits
+        h1 = x % self.bucket_size
+        h2 = (x // self.bucket_size) % self.bucket_size
+        
+        # Combine via addition (cheaper than concat)
+        return self.emb_1(h1) + self.emb_2(h2)
+    
+    def output_projection(self, hidden: torch.Tensor) -> torch.Tensor:
+        """
+        Compute logits from hidden states using the same hash embedding tables.
+        
+        This is the "reverse" of embedding lookup - we compute dot products
+        between hidden states and all vocab embeddings efficiently.
+        
+        Args:
+            hidden: [B, T, n_embd] hidden states
+            
+        Returns:
+            [B, T, vocab_size] logits
+        """
+        # Get all vocab embeddings: [vocab_size, n_embd]
+        all_emb = self.emb_1(self.h1_all) + self.emb_2(self.h2_all)
+        
+        # Compute logits: [B, T, n_embd] @ [n_embd, vocab_size] -> [B, T, vocab_size]
+        return hidden @ all_emb.t()
+    
+    def chunked_cross_entropy(self, hidden: torch.Tensor, targets: torch.Tensor, 
+                               chunk_size: int = 4096) -> torch.Tensor:
+        """
+        Compute cross entropy loss in chunks to avoid materializing full logits.
+        
+        Instead of: logits = hidden @ all_emb.T  (creates [B*T, vocab_size])
+        We compute loss in vocab chunks, never creating the full logits tensor.
+        
+        Memory: O(B*T*chunk_size) instead of O(B*T*vocab_size)
+        
+        Args:
+            hidden: [B, T, n_embd] hidden states
+            targets: [B, T] target token indices
+            chunk_size: Vocab chunk size for memory efficiency
+            
+        Returns:
+            Scalar cross entropy loss
+        """
+        B, T, D = hidden.shape
+        hidden_flat = hidden.view(-1, D)  # [B*T, n_embd]
+        targets_flat = targets.view(-1)   # [B*T]
+        
+        # We need to compute: -log(softmax(logits)[target])
+        # = -logits[target] + log(sum(exp(logits)))
+        # Using the log-sum-exp trick for numerical stability
+        
+        # First pass: compute log-sum-exp over all vocab in chunks
+        max_logit = torch.full((B * T,), float('-inf'), device=hidden.device, dtype=hidden.dtype)
+        
+        for start in range(0, self.vocab_size, chunk_size):
+            end = min(start + chunk_size, self.vocab_size)
+            # Get embeddings for this chunk: [chunk_size, n_embd]
+            chunk_emb = self.emb_1(self.h1_all[start:end]) + self.emb_2(self.h2_all[start:end])
+            # Compute logits for this chunk: [B*T, chunk_size]
+            chunk_logits = hidden_flat @ chunk_emb.t()
+            # Update max
+            max_logit = torch.maximum(max_logit, chunk_logits.max(dim=-1).values)
+        
+        # Second pass: compute sum(exp(logits - max)) for numerical stability
+        sum_exp = torch.zeros((B * T,), device=hidden.device, dtype=torch.float32)
+        
+        for start in range(0, self.vocab_size, chunk_size):
+            end = min(start + chunk_size, self.vocab_size)
+            chunk_emb = self.emb_1(self.h1_all[start:end]) + self.emb_2(self.h2_all[start:end])
+            chunk_logits = hidden_flat @ chunk_emb.t()
+            sum_exp += torch.exp(chunk_logits.float() - max_logit.float().unsqueeze(-1)).sum(dim=-1)
+        
+        # log(sum(exp)) = max + log(sum(exp(x - max)))
+        log_sum_exp = max_logit.float() + torch.log(sum_exp)
+        
+        # Compute logit for target tokens: need to gather from correct chunk
+        target_logits = torch.zeros((B * T,), device=hidden.device, dtype=torch.float32)
+        for start in range(0, self.vocab_size, chunk_size):
+            end = min(start + chunk_size, self.vocab_size)
+            # Find which targets fall in this chunk
+            mask = (targets_flat >= start) & (targets_flat < end)
+            if mask.any():
+                chunk_emb = self.emb_1(self.h1_all[start:end]) + self.emb_2(self.h2_all[start:end])
+                chunk_logits = hidden_flat[mask] @ chunk_emb.t()  # [num_in_chunk, chunk_size]
+                local_targets = targets_flat[mask] - start  # Offset to chunk-local indices
+                target_logits[mask] = chunk_logits.float().gather(1, local_targets.unsqueeze(-1)).squeeze(-1)
+        
+        # Cross entropy: -logit[target] + log_sum_exp
+        loss = -target_logits.float() + log_sum_exp
+        return loss.mean()
+    
+    def extra_repr(self) -> str:
+        std_params = self.vocab_size * self.n_embd
+        hash_params = self.bucket_size * self.n_embd * 2
+        return f"vocab={self.vocab_size}, dim={self.n_embd}, bucket={self.bucket_size}, compression={std_params/hash_params:.1f}x"
 
 
 class KVCache:
@@ -361,11 +496,19 @@ class SpinNet(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.tok_embeddings = nn.Embedding(config.vocab_size, config.n_embd)
+        
+        # Embedding: hash or standard
+        if config.hash_embeddings:
+            self.tok_embeddings = HashEmbedding(config.vocab_size, config.n_embd)
+            self.output = None  # Use tok_embeddings.output_projection()
+        else:
+            self.tok_embeddings = nn.Embedding(config.vocab_size, config.n_embd)
+            self.output = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+            # Weight tying for standard embeddings
+            self.tok_embeddings.weight = self.output.weight
+        
         self.layers = nn.ModuleList([LlamaBlock(config) for _ in range(config.n_layer)])
         self.norm = RMSNorm(config.n_embd)
-        self.output = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.tok_embeddings.weight = self.output.weight
         freqs_cis = precompute_freqs_cis(config.n_embd // config.n_head, config.block_size * 2)
         self.register_buffer("freqs_cis", freqs_cis)
         self.apply(self._init_weights)
@@ -393,11 +536,23 @@ class SpinNet(nn.Module):
                 h = layer(h, freqs_cis, kv_cache=kv_cache, layer_idx=layer_idx)
 
         h = self.norm(h)
+        
+        # Training with targets
         if targets is not None:
-            logits = self.output(h)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            if self.output is not None:
+                # Standard embeddings: compute full logits
+                logits = self.output(h)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            else:
+                # Hash embeddings: use chunked cross entropy (memory efficient)
+                loss = self.tok_embeddings.chunked_cross_entropy(h, targets)
+                logits = None  # Don't compute logits during training (saves memory)
         else:
-            logits = self.output(h[:, [-1], :])
+            # Inference: compute logits for last position only
+            if self.output is not None:
+                logits = self.output(h[:, [-1], :])
+            else:
+                logits = self.tok_embeddings.output_projection(h[:, [-1], :])
             loss = None
         
         return logits, loss

@@ -38,6 +38,7 @@ dropout = 0.0
 bias = False 
 head_mixing = True   # Enable algebra-based head mixing
 algebra = "octonion" # "octonion" (8D) or "hadamard" (32D)
+hash_embeddings = False  # Use composite hash embeddings (25x compression)
 
 # AdamW
 learning_rate = 6e-4 
@@ -148,9 +149,10 @@ if init_from == 'scratch':
     # Get algebra settings from config
     head_mixing = config.get('head_mixing', False)
     algebra = config.get('algebra', 'octonion')
+    hash_embeddings = config.get('hash_embeddings', False)
     model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                       bias=bias, vocab_size=None, dropout=dropout, 
-                      head_mixing=head_mixing, algebra=algebra)
+                      head_mixing=head_mixing, algebra=algebra, hash_embeddings=hash_embeddings)
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = SpinNetConfig(**model_args)
     model = SpinNet(gptconf)
