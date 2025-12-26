@@ -370,9 +370,12 @@ class HadamardTernaryLinear(nn.Module):
         # 32 ternary weight matrices [32, out_o, in_o]
         self.weight = nn.Parameter(torch.rand(self.ALGEBRA_DIM, self.out_o, self.in_o) * 2 - 1)
         
-        # Variance-preserving beta: ternary E[w²] ≈ 2/3
+        # Alpha (input diagonal): per-feature scaling BEFORE FHT [32, in_o]
+        self.alpha = nn.Parameter(torch.ones(self.ALGEBRA_DIM, self.in_o))
+        
+        # Beta (output diagonal): per-feature scaling AFTER FHT [32, out_o]
         beta_init = math.sqrt(3.0 / (2.0 * self.in_o))
-        self.beta = nn.Parameter(torch.ones(self.out_o) * beta_init)
+        self.beta = nn.Parameter(torch.ones(self.ALGEBRA_DIM, self.out_o) * beta_init)
         
         # Quantization function (lazy import)
         self._quantize_fn = None
@@ -387,11 +390,7 @@ class HadamardTernaryLinear(nn.Module):
         """
         Forward pass with FHT mixing.
         
-        Args:
-            x: Input tensor [B, T, in_features]
-            
-        Returns:
-            Output tensor [B, T, out_features]
+        Architecture: y = β · FHT(W_ternary · FHT(α · x))
         """
         B, T, D = x.shape
         assert D == self.in_o * self.ALGEBRA_DIM
@@ -403,23 +402,23 @@ class HadamardTernaryLinear(nn.Module):
         # Split into 32 sub-groups: [B, T, 32, in_o]
         x_parts = x.view(B, T, self.ALGEBRA_DIM, self.in_o)
         
+        # Apply input diagonal scaling (α · x) - [32, in_o] broadcasts with [B, T, 32, in_o]
+        x_scaled = x_parts * self.alpha
+        
         # Apply FHT to mix across the 32 dimensions: [B, T, 32, in_o]
-        x_mixed = fht(x_parts.transpose(-2, -1)).transpose(-2, -1)  # FHT on dim=-2
+        x_mixed = fht(x_scaled.transpose(-2, -1)).transpose(-2, -1)  # FHT on dim=-2
         
         # Matrix multiply each group: y_i = x_mixed_i @ W[i].T
         # [B, T, 32, in_o] @ [32, in_o, out_o] -> [B, T, 32, out_o]
-        # Use einsum for batched matmul
         y_parts = torch.einsum('btgi,gio->btgo', x_mixed, w_q.transpose(-1, -2))
         
         # Apply FHT again to mix outputs
         y_mixed = fht(y_parts.transpose(-2, -1)).transpose(-2, -1)
         
-        # Reshape and apply learnable scale
-        y = y_mixed.reshape(B, T, -1)  # [B, T, out_features]
+        # Apply output scaling (β) - [32, out_o] broadcasts with [B, T, 32, out_o]
+        y_scaled = y_mixed * self.beta
         
-        # Apply beta scaling (broadcast across groups)
-        beta_expanded = self.beta.repeat(self.ALGEBRA_DIM)
-        return y * beta_expanded
+        return y_scaled.reshape(B, T, -1)  # [B, T, out_features]
     
     def extra_repr(self) -> str:
         return f"in={self.in_o * self.ALGEBRA_DIM}, out={self.out_o * self.ALGEBRA_DIM}, algebra=hadamard32"
@@ -433,16 +432,14 @@ class HadamardTernaryLinear(nn.Module):
 
 class HadamardLinear(nn.Module):
     """
-    32D Hadamard Linear layer with FHT mixing.
+    32D Hadamard Linear layer with FHT mixing and learned diagonals.
+    
+    Architecture: y = β · H · W_ternary · H · (α · x)
+    
+    The learned diagonals (α, β) provide fine-grained feature selection,
+    compensating for the coarse ternary weights and fixed Hadamard mixing.
     
     NOT truly fused - issues 3 separate kernels: einsum(FHT) -> einsum(MatMul) -> einsum(FHT).
-    True fusion would require keeping all data in SRAM, which is difficult because
-    FHT mixes across dim 32 while MatMul sums across in_o.
-    
-    Variance analysis:
-    - FHT with normalized H preserves variance (orthonormal)
-    - Ternary weights {-1,0,+1} have E[w²] ≈ 2/3 (assuming ~1/3 each)
-    - Beta is initialized to sqrt(1 / (in_o * 2/3)) for variance preservation
     """
     
     ALGEBRA_DIM = 32
@@ -457,12 +454,17 @@ class HadamardLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         
+        # Ternary weight matrix
         self.weight = nn.Parameter(torch.rand(self.ALGEBRA_DIM, self.out_o, self.in_o) * 2 - 1)
         
-        # Beta initialization: variance-preserving for ternary weights
-        # Ternary E[w²] ≈ 2/3, so scale = sqrt(1 / (fan_in * 2/3)) = sqrt(3 / (2 * in_o))
+        # Alpha (input diagonal): per-feature scaling BEFORE FHT
+        # Shape [32, in_o] for full resolution within each Hadamard group
+        self.alpha = nn.Parameter(torch.ones(self.ALGEBRA_DIM, self.in_o))
+        
+        # Beta (output diagonal): per-feature scaling AFTER FHT
+        # Shape [32, out_o] for full resolution, with variance-preserving init
         beta_init = math.sqrt(3.0 / (2.0 * self.in_o))
-        self.beta = nn.Parameter(torch.ones(self.out_o) * beta_init)
+        self.beta = nn.Parameter(torch.ones(self.ALGEBRA_DIM, self.out_o) * beta_init)
         
         # Cache Hadamard matrix for FHT
         self.register_buffer('H', hadamard_matrix(self.ALGEBRA_DIM, normalize=True))
@@ -486,9 +488,13 @@ class HadamardLinear(nn.Module):
         # Reshape: [B, T, 32, in_o]
         x_parts = x.view(B, T, self.ALGEBRA_DIM, self.in_o)
         
+        # Apply input diagonal scaling (α · x) - per-feature before FHT
+        # alpha is [32, in_o], broadcasts with [B, T, 32, in_o]
+        x_scaled = x_parts * self.alpha
+        
         # FHT via matrix multiply with FP32 accumulator for stability
         # [B, T, 32, in_o] with H [32, 32] on dim 2
-        x_mixed = torch.einsum('btgi,gh->bthi', x_parts.float(), self.H)
+        x_mixed = torch.einsum('btgi,gh->bthi', x_scaled.float(), self.H)
         
         # Batched matmul with FP32 accumulator: [B, T, 32, in_o] @ [32, out_o, in_o].T -> [B, T, 32, out_o]
         y_parts = torch.einsum('btgi,goi->btgo', x_mixed, w_q.float())
@@ -496,10 +502,12 @@ class HadamardLinear(nn.Module):
         # FHT on output
         y_mixed = torch.einsum('btgo,gh->btho', y_parts, self.H)
         
-        # Reshape and scale, restore original dtype
-        y = y_mixed.reshape(B, T, -1).to(orig_dtype)
-        beta_expanded = self.beta.repeat(self.ALGEBRA_DIM)
-        return y * beta_expanded
+        # Apply output scaling (β) - per-feature after FHT
+        # beta is [32, out_o], broadcasts with [B, T, 32, out_o]
+        y_scaled = y_mixed * self.beta
+        
+        # Reshape and restore original dtype
+        return y_scaled.reshape(B, T, -1).to(orig_dtype)
 
 
 # -----------------------------------------------------------------------------
