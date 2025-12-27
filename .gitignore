@@ -31,3 +31,4 @@ inference/Cargo.lock
 # Logs
 *.log
 runs/
+data/mnist/MNIST

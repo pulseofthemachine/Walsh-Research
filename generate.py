@@ -54,7 +54,7 @@ def main():
     
     print(f"Model: {config.n_layer} layers, {config.n_head} heads, {config.n_embd} dim")
     print(f"Vocab size: {config.vocab_size}")
-    print(f"Algebra: {getattr(config, 'algebra', 'octonion')} | Head mixing: {getattr(config, 'head_mixing', False)}")
+    print(f"Algebra: {getattr(config, 'algebra', 'octonion')} | Head mixing: {getattr(config, 'head_mixing', False)} | Hash embeddings: {getattr(config, 'hash_embeddings', False)}")
     
     model = SpinNet(config)
     
