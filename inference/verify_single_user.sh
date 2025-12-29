@@ -35,7 +35,7 @@ done
 
 # 4. Finish Forward (Sample first token)
 echo "Finish forward (First token)..."
-FIRST_TOKEN=$(dfx canister call walsh_backend finish_forward | sed 's/(\"//;s/\")//')
+FIRST_TOKEN=$(dfx canister call walsh_backend finish_forward --output json | jq -r '.')
 echo "Token 1: $FIRST_TOKEN"
 
 # 5. Generate N Tokens with Adaptive Looping
@@ -49,13 +49,10 @@ while [ $GENERATED -lt $N ]; do
     REMAINING=$((N - GENERATED))
     
     # Request remaining tokens (will get partial if budget exceeded)
-    RAW=$(dfx canister call walsh_backend generate_n_tokens "($REMAINING)")
+    RAW_JSON=$(dfx canister call walsh_backend generate_n_tokens "($REMAINING)" --output json)
     
-    # Extract just the text (remove candid wrapping)
-    CHUNK=$(echo "$RAW" | sed 's/(\"//;s/\")//;s/\\n/\n/g')
-    
-    # For GPT-2, count tokens by looking at response structure
-    # (Each call returns decoded string, not individual chars)
+    # Extract just the text using jq
+    CHUNK=$(echo "$RAW_JSON" | jq -r '.')
     CHUNK_LEN=${#CHUNK}
     
     if [ $CHUNK_LEN -eq 0 ]; then
@@ -64,11 +61,10 @@ while [ $GENERATED -lt $N ]; do
     fi
     
     TOTAL_OUTPUT+="$CHUNK"
-    # Estimate tokens (GPT-2 averages ~4 chars per token)
-    TOKEN_ESTIMATE=$((CHUNK_LEN / 4))
-    [ $TOKEN_ESTIMATE -eq 0 ] && TOKEN_ESTIMATE=1
+    # For character-level model: 1 char = 1 token
+    TOKEN_ESTIMATE=$CHUNK_LEN
     GENERATED=$((GENERATED + TOKEN_ESTIMATE))
-    echo "  Generated ~$TOKEN_ESTIMATE tokens (total: ~$GENERATED/$N)"
+    echo "  Generated $TOKEN_ESTIMATE tokens (total: $GENERATED/$N)"
 done
 
 BURST_END=$(date +%s.%N)

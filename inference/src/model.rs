@@ -4,13 +4,13 @@
 //! Supports both 8D Octonion and 32D Hadamard algebra modes.
 
 use crate::attention::{rms_norm, attention, attention_cached, silu};
+use crate::hadamard::hadamard_linear;
 use crate::tokenizer::Tokenizer;
 
 /// Hash embedding for ultra-compressed vocab representation
 /// Uses 3 embedding tables with learned importance weights
 pub struct HashEmbedding {
     tables: Vec<Vec<f32>>,      // 3 tables: [bucket_size, n_embd] each
-    table_scales: Vec<f32>,     // INT8 dequantization scales per table
     importance: Vec<f32>,       // [vocab_size, 3] learned weights per token/table
     indices: Vec<i32>,          // [vocab_size, 3] precomputed hash indices
     bucket_size: usize,
@@ -23,7 +23,6 @@ pub struct WalshModel {
     pub config: ModelConfig,
     // Standard embeddings (for octonion/non-hash models)
     embeddings: Vec<f32>,              // [vocab_size, n_embd]
-    embed_scale: f32,
     // Hash embeddings (for hadamard + hash_embeddings=true)
     hash_embedding: Option<HashEmbedding>,
     layers: Vec<TransformerLayer>,
@@ -40,19 +39,19 @@ pub struct ModelConfig {
     pub n_layer: usize,
     pub n_head: usize,
     pub block_size: usize,
-    pub algebra: String,           // "octonion" (8D) or "hadamard" (32D)
-    pub hash_embeddings: bool,     // Use hash embedding tables
 }
 
 /// Bitmask ternary weight - smallest format with sparse iteration
 /// bitmask: 1 bit per position (1 = non-zero)
 /// sign_bits: 1 bit per non-zero (0 = -1, 1 = +1)
 pub struct BitmaskWeight {
-    bitmask: Vec<u8>,      // 1 bit per position marking non-zero
-    sign_bits: Vec<u8>,    // 1 bit per non-zero, packed (0=-1, 1=+1)
-    num_nonzero: usize,    // Total count of non-zeros
-    shape: (usize, usize), // (out_dim, in_dim) logical dimensions
-    beta: Vec<f32>,        // Per-output-part scaling
+    pub bitmask: Vec<u8>,      // 1 bit per position marking non-zero
+    pub sign_bits: Vec<u8>,    // 1 bit per non-zero, packed (0=-1, 1=+1)
+    pub shape: (usize, usize), // (out_dim, in_dim) logical dimensions
+    shape3d: (usize, usize, usize), // (algebra_dim, out_per_part, in_per_part)
+    algebra_dim: usize,    // 8 for octonion, 32 for hadamard
+    alpha: Vec<f32>,       // Per-input-part scaling [algebra_dim * in_per_part]
+    beta: Vec<f32>,        // Per-output-part scaling [algebra_dim * out_per_part]
 }
 
 pub struct TransformerLayer {
@@ -135,21 +134,21 @@ impl WalshModel {
         
         // Storage for parsed weights
         let mut embeddings = Vec::new();
-        let mut embed_scale = 1.0f32;
         let mut final_norm = Vec::new();
         let mut rope_cos = Vec::new();
         let mut rope_sin = Vec::new();
         let mut layers: Vec<TransformerLayer> = Vec::new();
         
         // Hash embedding storage (for hadamard + hash_embeddings mode)
-        let mut hash_tables: Vec<(String, Vec<f32>, f32)> = Vec::new();  // (name, data, scale)
+        let mut hash_tables: Vec<(String, Vec<f32>)> = Vec::new();  // (name, data)
         let mut hash_importance: Vec<f32> = Vec::new();
         let mut hash_indices: Vec<i32> = Vec::new();
         
         // Weight name -> data storage
         let mut bitmask_weights: std::collections::HashMap<String, BitmaskWeight> = std::collections::HashMap::new();
         let mut norm_weights: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
-        let mut scale_weights: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+        let mut scale_weights: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();  // beta
+        let mut alpha_weights: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();  // alpha
         // Head mixer weights: name -> flattened [8, D, D] or [D]
         let mut head_mixer_w_raw: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
         let mut head_mixer_beta_raw: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
@@ -171,7 +170,6 @@ impl WalshModel {
                     let arr = read_array_i8(data, &mut cursor)?;
                     
                     if name.contains("tok_embeddings") {
-                        embed_scale = scale;
                         embeddings = arr.iter().map(|&x| x as f32 * scale).collect();
                     }
                 }
@@ -188,19 +186,24 @@ impl WalshModel {
                         shape_vec.push(read_u32(data, &mut cursor)? as usize);
                     }
                     
-                    // Shape is [8, out_per_part, in_per_part] for 3D octonion weights
-                    let (out_dim, in_dim) = if ndim == 3 {
-                        let out_per_part = shape_vec[1];
-                        let in_per_part = shape_vec[2];
-                        (8 * out_per_part, 8 * in_per_part)
+                    // Shape is [algebra_dim, out_per_part, in_per_part] for 3D algebra weights
+                    // algebra_dim = 8 for octonion, 32 for hadamard
+                    let (algebra_dim, out_per_part, in_per_part, out_dim, in_dim) = if ndim == 3 {
+                        let alg = shape_vec[0];
+                        let o_per = shape_vec[1];
+                        let i_per = shape_vec[2];
+                        (alg, o_per, i_per, alg * o_per, alg * i_per)
                     } else if ndim == 2 {
-                        (shape_vec[0], shape_vec[1])
+                        // 2D weights - assume 8D octonion for backwards compatibility
+                        let out = shape_vec[0];
+                        let inp = shape_vec[1];
+                        (8, out / 8, inp / 8, out, inp)
                     } else {
-                        (1, 1)
+                        (8, 1, 1, 1, 1)
                     };
                     
-                    // Read num_nonzero
-                    let num_nonzero = read_u32(data, &mut cursor)? as usize;
+                    // Read num_nonzero (still read to advance cursor, but not stored)
+                    let _num_nonzero = read_u32(data, &mut cursor)? as usize;
                     
                     // Read bitmask bytes
                     let bitmask_len = read_u32(data, &mut cursor)? as usize;
@@ -215,37 +218,12 @@ impl WalshModel {
                     bitmask_weights.insert(name, BitmaskWeight {
                         bitmask,
                         sign_bits,
-                        num_nonzero,
                         shape: (out_dim, in_dim),
-                        beta: vec![1.0; out_dim / 8],  // beta is per out_per_part
+                        shape3d: (algebra_dim, out_per_part, in_per_part),
+                        algebra_dim,
+                        alpha: vec![1.0; algebra_dim * in_per_part],   // default, will be overwritten
+                        beta: vec![1.0; algebra_dim * out_per_part],   // default, will be overwritten
                     });
-                }
-                b'W' => {
-                    // Legacy sparse format - skip with warning
-                    let name = read_name(data, &mut cursor)?;
-                    let ndim = data[cursor] as usize;
-                    cursor += 1;
-                    for _ in 0..ndim {
-                        cursor += 4;
-                    }
-                    let num_pos = read_u32(data, &mut cursor)? as usize;
-                    let num_neg = read_u32(data, &mut cursor)? as usize;
-                    cursor += (num_pos + num_neg) * 4;
-                    ic_cdk::println!("Warning: Skipping legacy sparse weight: {}", name);
-                }
-                b'T' => {
-                    // Legacy packed ternary - skip with warning
-                    let name = read_name(data, &mut cursor)?;
-                    let ndim = data[cursor] as usize;
-                    cursor += 1;
-                    for _ in 0..ndim {
-                        cursor += 4; // Skip u32 dims
-                    }
-                    // Skip the array data
-                    let (_dtype, arr_shape) = read_array_header(data, &mut cursor)?;
-                    let arr_size: usize = arr_shape.iter().product();
-                    cursor += arr_size;
-                    ic_cdk::println!("Warning: Skipping legacy packed weight: {}", name);
                 }
                 b'N' => {
                     // Norm weights
@@ -262,6 +240,12 @@ impl WalshModel {
                     let name = read_name(data, &mut cursor)?;
                     let arr = read_array_f16_as_f32(data, &mut cursor)?;
                     scale_weights.insert(name, arr);
+                }
+                b'L' => {
+                    // Alpha (input scale)
+                    let name = read_name(data, &mut cursor)?;
+                    let arr = read_array_f16_as_f32(data, &mut cursor)?;
+                    alpha_weights.insert(name, arr);
                 }
                 b'R' => {
                     // RoPE frequencies
@@ -290,10 +274,10 @@ impl WalshModel {
                 b'A' => {
                     // Hash embedding table - INT8 with scale
                     let name = read_name(data, &mut cursor)?;
-                    let scale = read_f32(data, &mut cursor)?;
+                    let scale = read_f32(data, &mut cursor)?; // Still read scale to advance cursor
                     let arr = read_array_i8(data, &mut cursor)?;
                     let arr_f32: Vec<f32> = arr.iter().map(|&x| x as f32 * scale).collect();
-                    hash_tables.push((name, arr_f32, scale));
+                    hash_tables.push((name, arr_f32));
                 }
                 b'I' => {
                     // Hash importance weights - FP16
@@ -323,20 +307,37 @@ impl WalshModel {
             
             let mut get_bitmask = |suffix: &str| -> BitmaskWeight {
                 let weight_key = format!("{}.{}", prefix, suffix);
-                let beta_key = weight_key.replace(".weight", ".beta");
+                // Also try .inner.weight for HadamardTernaryLinear models
+                let inner_weight_key = weight_key.replace(".weight", ".inner.weight");
                 
                 let out_per_part = config.n_embd / 8;
-                let mut bw = bitmask_weights.remove(&weight_key).unwrap_or_else(|| BitmaskWeight {
-                    bitmask: Vec::new(),
-                    sign_bits: Vec::new(),
-                    num_nonzero: 0,
-                    shape: (config.n_embd, config.n_embd),
-                    beta: vec![1.0; out_per_part],
-                });
+                let in_per_part = config.n_embd / 8;
                 
-                // Apply beta scales if available
-                if let Some(beta) = scale_weights.remove(&beta_key) {
+                // Try standard key first, then inner key
+                let mut bw = bitmask_weights.remove(&weight_key)
+                    .or_else(|| bitmask_weights.remove(&inner_weight_key))
+                    .unwrap_or_else(|| BitmaskWeight {
+                        bitmask: Vec::new(),
+                        sign_bits: Vec::new(),
+                        shape: (config.n_embd, config.n_embd),
+                        shape3d: (8, out_per_part, in_per_part),
+                        algebra_dim: 8,
+                        alpha: vec![1.0; 8 * in_per_part],
+                        beta: vec![1.0; 8 * out_per_part],
+                    });
+                
+                // Apply beta scales if available (try both key patterns)
+                let beta_key = weight_key.replace(".weight", ".beta");
+                let inner_beta_key = weight_key.replace(".weight", ".inner.beta");
+                if let Some(beta) = scale_weights.remove(&beta_key).or_else(|| scale_weights.remove(&inner_beta_key)) {
                     bw.beta = beta;
+                }
+                
+                // Apply alpha scales if available (try both key patterns)
+                let alpha_key = weight_key.replace(".weight", ".alpha");
+                let inner_alpha_key = weight_key.replace(".weight", ".inner.alpha");
+                if let Some(alpha) = alpha_weights.remove(&alpha_key).or_else(|| alpha_weights.remove(&inner_alpha_key)) {
+                    bw.alpha = alpha;
                 }
                 
                 bw
@@ -353,9 +354,20 @@ impl WalshModel {
             let hm_beta_key = format!("{}.attention.head_mixer.beta", prefix);
             
             let head_mixer_w = head_mixer_w_raw.remove(&hm_w_key).map(|flat| {
-                // Reshape from flat [8 * D * D] to [8][D][D]
-                let mut w = vec![vec![vec![0.0f32; head_dim]; head_dim]; 8];
-                for i in 0..8 {
+                // Reshape from flat [algebra_dim * D * D] to [algebra_dim][D][D]
+                // Detect algebra_dim from flat length: len = algebra_dim * head_dim * head_dim
+                let total = flat.len();
+                let algebra_dim = if total == 32 * head_dim * head_dim {
+                    32  // Hadamard
+                } else if total == 8 * head_dim * head_dim {
+                    8   // Octonion
+                } else {
+                    // Fallback: try to infer
+                    total / (head_dim * head_dim)
+                };
+                
+                let mut w = vec![vec![vec![0.0f32; head_dim]; head_dim]; algebra_dim];
+                for i in 0..algebra_dim {
                     for j in 0..head_dim {
                         for k in 0..head_dim {
                             let idx = i * head_dim * head_dim + j * head_dim + k;
@@ -398,12 +410,10 @@ impl WalshModel {
             let bucket_size = sorted_tables[0].1.len() / config.n_embd;
             let num_tables = 3;
             
-            let tables: Vec<Vec<f32>> = sorted_tables.iter().map(|(_, data, _)| data.clone()).collect();
-            let table_scales: Vec<f32> = sorted_tables.iter().map(|(_, _, scale)| *scale).collect();
+            let tables: Vec<Vec<f32>> = sorted_tables.into_iter().map(|(_, data)| data).collect();
             
             Some(HashEmbedding {
                 tables,
-                table_scales,
                 importance: hash_importance,
                 indices: hash_indices,
                 bucket_size,
@@ -431,7 +441,6 @@ impl WalshModel {
         Ok(WalshModel {
             config,
             embeddings,
-            embed_scale,
             hash_embedding,
             layers,
             final_norm,
@@ -454,30 +463,6 @@ impl WalshModel {
     /// Decode multiple tokens to string  
     pub fn decode_tokens(&self, tokens: &[usize]) -> String {
         self.tokenizer.decode_tokens(tokens)
-    }
-    
-    /// Single forward pass returning next token (for chunked generation)
-    pub fn forward_single_token(&self, tokens: &[usize]) -> usize {
-        // Use simple embedding-based prediction for speed
-        // Full transformer is too slow even for single token
-        let n_embd = self.config.n_embd;
-        let last_token = tokens.last().copied().unwrap_or(0) % self.config.vocab_size;
-        let emb_start = last_token * n_embd;
-        
-        let mut logits = vec![0.0f32; self.config.vocab_size];
-        for v in 0..self.config.vocab_size {
-            let mut dot = 0.0f32;
-            for i in 0..n_embd {
-                let emb_idx = emb_start + i;
-                let weight_idx = v * n_embd + i;
-                if emb_idx < self.embeddings.len() && weight_idx < self.embeddings.len() {
-                    dot += self.embeddings[emb_idx] * self.embeddings[weight_idx];
-                }
-            }
-            logits[v] = dot;
-        }
-        
-        sample_with_temperature(&logits, 0.8)
     }
     
     /// Embed tokens to hidden states (first step of chunked forward)
@@ -605,9 +590,13 @@ impl WalshModel {
         // Attention: new Q attends to full K,V
         let mut attn_out = attention_cached(&q_new, k_full, v_full, new_len, full_len, n_head, head_dim);
         
-        // Apply head mixer if present (octonion attention mixing)
+        // Apply head mixer if present
         if let (Some(ref w), Some(ref beta)) = (&layer.head_mixer_w, &layer.head_mixer_beta) {
-            attn_out = self.apply_head_mixer(&attn_out, w, beta, new_len, n_head, head_dim);
+            if n_head == 32 {
+                attn_out = self.apply_hadamard_head_mixer(&attn_out, w, beta, new_len, n_head, head_dim);
+            } else if n_head == 8 {
+                attn_out = self.apply_head_mixer(&attn_out, w, beta, new_len, n_head, head_dim);
+            }
         }
         
         // Output projection
@@ -704,6 +693,115 @@ impl WalshModel {
         
         y
     }
+    
+    /// Hadamard head mixer for 32-head models
+    /// Uses FHT mixing instead of Cayley-Dickson
+    /// Algorithm: y = beta * FHT(W @ FHT(x))
+    fn apply_hadamard_head_mixer(
+        &self,
+        attn_out: &[f32],  // [seq_len * n_embd] = [seq_len * 32 * head_dim]
+        w: &[Vec<Vec<f32>>],  // [32][head_dim][head_dim]
+        beta: &[f32],  // [head_dim]
+        seq_len: usize,
+        n_head: usize,  // Should be 32
+        head_dim: usize,
+    ) -> Vec<f32> {
+        use crate::hadamard::fht_32;
+        
+        let n_embd = n_head * head_dim;
+        let mut y = vec![0.0f32; seq_len * n_embd];
+        
+        // Process each token position
+        for t in 0..seq_len {
+            let base = t * n_embd;
+            
+            // For each output dimension across all heads
+            for d_out in 0..head_dim {
+                // Gather input values across 32 heads for this dimension
+                let mut x_group: [f32; 32] = [0.0; 32];
+                for h in 0..32 {
+                    x_group[h] = attn_out.get(base + h * head_dim + d_out).copied().unwrap_or(0.0);
+                }
+                
+                // Step 1: FHT on the 32-head dimension
+                fht_32(&mut x_group);
+                
+                // Step 2: Per-head linear transform: y_h = sum_d_in(x_fht[h] * W[h, d_in, d_out])
+                // Actually for head mixer, W is [32, head_dim, head_dim]
+                // The operation is: for each head h, y[h, d_out] = sum_d_in(x_fht[h, d_in] * W[h, d_in, d_out])
+                // But we're iterating by d_out, so we need to accumulate across d_in
+                
+                // For head mixing, each head has its own W matrix
+                // y[h] = x[h] @ W[h].T means y[h, d_out] = sum_d_in(x[h, d_in] * W[h, d_in, d_out])
+                
+                // Here we're computing for a single d_out across all heads
+                // Need to restructure: compute full output for this position
+            }
+            
+            // Actually, let's restructure to process properly
+            // For each head, we need to do: y[h] = x_fht[h] @ W[h].T
+            
+            // Gather all head outputs for this position: [32, head_dim]
+            let mut x_heads: [[f32; 8]; 32] = [[0.0; 8]; 32];  // Assuming head_dim=8
+            for h in 0..32 {
+                for d in 0..head_dim.min(8) {
+                    x_heads[h][d] = attn_out.get(base + h * head_dim + d).copied().unwrap_or(0.0);
+                }
+            }
+            
+            // Step 1: FHT on head dimension for each feature
+            for d in 0..head_dim.min(8) {
+                let mut group: [f32; 32] = [0.0; 32];
+                for h in 0..32 {
+                    group[h] = x_heads[h][d];
+                }
+                fht_32(&mut group);
+                for h in 0..32 {
+                    x_heads[h][d] = group[h];
+                }
+            }
+            
+            // Step 2: Per-head linear transform
+            let mut y_heads: [[f32; 8]; 32] = [[0.0; 8]; 32];
+            for h in 0..32.min(w.len()) {
+                // y[h] = x[h] @ W[h].T
+                for d_out in 0..head_dim.min(8) {
+                    let mut dot = 0.0f32;
+                    for d_in in 0..head_dim.min(8) {
+                        let w_val = w.get(h)
+                            .and_then(|m| m.get(d_in))
+                            .and_then(|row| row.get(d_out))
+                            .copied()
+                            .unwrap_or(0.0);
+                        dot += x_heads[h][d_in] * w_val;
+                    }
+                    y_heads[h][d_out] = dot;
+                }
+            }
+            
+            // Step 3: FHT on head dimension for output
+            for d in 0..head_dim.min(8) {
+                let mut group: [f32; 32] = [0.0; 32];
+                for h in 0..32 {
+                    group[h] = y_heads[h][d];
+                }
+                fht_32(&mut group);
+                for h in 0..32 {
+                    y_heads[h][d] = group[h];
+                }
+            }
+            
+            // Step 4: Apply beta scaling and write output
+            for h in 0..32 {
+                for d in 0..head_dim.min(8) {
+                    let b = beta.get(d).copied().unwrap_or(1.0);
+                    y[base + h * head_dim + d] = y_heads[h][d] * b;
+                }
+            }
+        }
+        
+        y
+    }
 
     /// Final normalization and sample next token (last step of chunked forward)
     pub fn final_norm_and_sample(&self, hidden: &[f32], seq_len: usize) -> usize {
@@ -763,61 +861,16 @@ impl WalshModel {
         Ok(self.decode_tokens(&tokens))
     }
     
-    /// Simple generation using embeddings only (fast, for query calls)
-    pub fn generate_simple(&self, prompt: &str, max_tokens: usize) -> Result<String, String> {
-        let n_embd = self.config.n_embd;
-        
-        let mut tokens: Vec<usize> = self.tokenize(prompt);
-        
-        for _ in 0..max_tokens {
-            if tokens.len() >= self.config.block_size {
-                break;
-            }
-            
-            // Simple embedding-based prediction
-            let last_token = tokens.last().copied().unwrap_or(0) % self.config.vocab_size;
-            let emb_start = last_token * n_embd;
-            
-            // Project to vocabulary using tied embeddings
-            let mut logits = vec![0.0f32; self.config.vocab_size];
-            for v in 0..self.config.vocab_size {
-                let mut dot = 0.0f32;
-                for i in 0..n_embd {
-                    let emb_idx = emb_start + i;
-                    let weight_idx = v * n_embd + i;
-                    if emb_idx < self.embeddings.len() && weight_idx < self.embeddings.len() {
-                        dot += self.embeddings[emb_idx] * self.embeddings[weight_idx];
-                    }
-                }
-                logits[v] = dot;
-            }
-            
-            let next_token = sample_with_temperature(&logits, 0.8);
-            tokens.push(next_token);
-        }
-        
-        Ok(self.decode_tokens(&tokens))
-    }
     
     fn forward(&self, tokens: &[usize]) -> Vec<f32> {
         let n_embd = self.config.n_embd;
         let seq_len = tokens.len();
         
-        // Embedding lookup
-        let mut h = vec![0.0f32; seq_len * n_embd];
-        for (t, &tok) in tokens.iter().enumerate() {
-            let tok = tok % self.config.vocab_size;
-            let start = tok * n_embd;
-            let end = start + n_embd;
-            if end <= self.embeddings.len() {
-                for i in 0..n_embd {
-                    h[t * n_embd + i] = self.embeddings[start + i];
-                }
-            }
-        }
+        // Embedding lookup (reuse embed_tokens which handles hash embeddings)
+        let mut h = self.embed_tokens(tokens);
         
         // Transformer layers
-        for layer in &self.layers {
+        for (idx, layer) in self.layers.iter().enumerate() {
             h = self.transformer_block(&h, layer, seq_len);
         }
         
@@ -825,14 +878,28 @@ impl WalshModel {
         let last_pos = (seq_len - 1) * n_embd;
         let hidden = rms_norm(&h[last_pos..last_pos + n_embd], &self.final_norm, 1e-6);
         
-        // Output projection (tied embeddings)
+        // Output projection
         let mut logits = vec![0.0f32; self.config.vocab_size];
-        for v in 0..self.config.vocab_size {
-            let mut dot = 0.0f32;
-            for i in 0..n_embd {
-                dot += hidden[i] * self.embeddings[v * n_embd + i];
+        
+        if let Some(ref hash_emb) = self.hash_embedding {
+            // Hash embedding output projection
+            for v in 0..self.config.vocab_size {
+                let emb = self.hash_embed_single(hash_emb, v);
+                let mut dot = 0.0f32;
+                for i in 0..n_embd {
+                    dot += hidden[i] * emb[i];
+                }
+                logits[v] = dot;
             }
-            logits[v] = dot;
+        } else {
+            // Standard tied embeddings
+            for v in 0..self.config.vocab_size {
+                let mut dot = 0.0f32;
+                for i in 0..n_embd {
+                    dot += hidden[i] * self.embeddings[v * n_embd + i];
+                }
+                logits[v] = dot;
+            }
         }
         
         logits
@@ -862,9 +929,14 @@ impl WalshModel {
         // Attention
         let mut attn_out = attention(&q, &k, &v, n_head, head_dim);
         
-        // Apply head mixer if present (octonion attention mixing)
+        // Apply head mixer if present
+        // Dispatch based on number of heads: 8 = octonion, 32 = hadamard
         if let (Some(ref w), Some(ref beta)) = (&layer.head_mixer_w, &layer.head_mixer_beta) {
-            attn_out = self.apply_head_mixer(&attn_out, w, beta, seq_len, n_head, head_dim);
+            if n_head == 32 {
+                attn_out = self.apply_hadamard_head_mixer(&attn_out, w, beta, seq_len, n_head, head_dim);
+            } else if n_head == 8 {
+                attn_out = self.apply_head_mixer(&attn_out, w, beta, seq_len, n_head, head_dim);
+            }
         }
         
         // Output projection
@@ -903,10 +975,37 @@ impl WalshModel {
     
     /// Bitmask ternary matmul with octonion structure (OPTIMIZED)
     /// Uses counter-based iteration to avoid expensive division operations.
-    /// Input x: [batch, in_dim] where in_dim = 8 * in_per_part
+    /// Input x: [batch, in_dim] where in_dim = algebra_dim * in_per_part
     /// Weight w: BitmaskWeight with bitmask and sign_bits
-    /// Output: [batch, out_dim] where out_dim = 8 * out_per_part
+    /// Output: [batch, out_dim] where out_dim = algebra_dim * out_per_part
     fn bitmask_matmul(&self, x: &[f32], w: &BitmaskWeight, batch: usize, in_dim: usize, out_dim: usize) -> Vec<f32> {
+        // Dispatch to Hadamard implementation for 32D algebra
+        if w.algebra_dim == 32 {
+            let (_, out_per_part, in_per_part) = w.shape3d;
+            let mut result = Vec::with_capacity(batch * out_dim);
+            
+            // Process each item in batch
+            for b in 0..batch {
+                let x_slice = &x[b * in_dim..(b + 1) * in_dim];
+                
+                // Use stored alpha/beta for correct scaling
+                
+                let y = hadamard_linear(
+                    x_slice,
+                    &w.bitmask,
+                    &w.sign_bits,
+                    &w.alpha,
+                    &w.beta,
+                    in_per_part,
+                    out_per_part,
+                );
+                
+                result.extend_from_slice(&y);
+            }
+            return result;
+        }
+        
+        // Octonion (8D) path below
         // Sign table for Cayley-Dickson octonion multiplication
         const SIGN: [[i8; 8]; 8] = [
             [1, -1, -1, -1, -1, -1, -1, -1],
@@ -1195,15 +1294,6 @@ fn read_array_i8(data: &[u8], cursor: &mut usize) -> Result<Vec<i8>, String> {
     Ok(arr)
 }
 
-fn read_array_u8(data: &[u8], cursor: &mut usize) -> Result<Vec<u8>, String> {
-    let (_, shape) = read_array_header(data, cursor)?;
-    let size: usize = shape.iter().product();
-    if *cursor + size > data.len() { return Err("u8 array overflow".to_string()); }
-    let arr = data[*cursor..*cursor + size].to_vec();
-    *cursor += size;
-    Ok(arr)
-}
-
 fn read_array_i32(data: &[u8], cursor: &mut usize) -> Result<Vec<i32>, String> {
     let (_, shape) = read_array_header(data, cursor)?;
     let size: usize = shape.iter().product();
@@ -1215,13 +1305,6 @@ fn read_array_i32(data: &[u8], cursor: &mut usize) -> Result<Vec<i32>, String> {
     }
     *cursor += size * 4;
     Ok(arr)
-}
-
-fn read_i32_single(data: &[u8], cursor: &mut usize) -> Result<i32, String> {
-    if *cursor + 4 > data.len() { return Err("i32 single overflow".to_string()); }
-    let v = i32::from_le_bytes([data[*cursor], data[*cursor+1], data[*cursor+2], data[*cursor+3]]);
-    *cursor += 4;
-    Ok(v)
 }
 
 fn read_array_f16_as_f32(data: &[u8], cursor: &mut usize) -> Result<Vec<f32>, String> {
@@ -1291,42 +1374,12 @@ fn parse_config(json: &str) -> Result<ModelConfig, String> {
         rest[..end].trim().parse().ok()
     };
     
-    // Extract string values for algebra
-    let extract_str = |key: &str| -> Option<String> {
-        let pattern = format!("\"{}\":", key);
-        let start = json.find(&pattern)? + pattern.len();
-        let rest = &json[start..].trim_start();
-        if rest.starts_with('"') {
-            let rest = &rest[1..];
-            let end = rest.find('"')?;
-            Some(rest[..end].to_string())
-        } else {
-            None
-        }
-    };
-    
-    // Extract boolean values
-    let extract_bool = |key: &str| -> Option<bool> {
-        let pattern = format!("\"{}\":", key);
-        let start = json.find(&pattern)? + pattern.len();
-        let rest = &json[start..].trim_start();
-        if rest.starts_with("true") {
-            Some(true)
-        } else if rest.starts_with("false") {
-            Some(false)
-        } else {
-            None
-        }
-    };
-    
     Ok(ModelConfig {
         vocab_size: extract("vocab_size").unwrap_or(65),
         n_embd: extract("n_embd").unwrap_or(256),
         n_layer: extract("n_layer").unwrap_or(8),
         n_head: extract("n_head").unwrap_or(8),
         block_size: extract("block_size").unwrap_or(512),
-        algebra: extract_str("algebra").unwrap_or_else(|| "octonion".to_string()),
-        hash_embeddings: extract_bool("hash_embeddings").unwrap_or(false),
     })
 }
 
@@ -1355,13 +1408,6 @@ fn rand_u64() -> u64 {
 
 fn rand_f32() -> f32 {
     (rand_u64() >> 40) as f32 / (1u64 << 24) as f32
-}
-
-/// Seed the RNG (call with time or counter for non-determinism)
-pub fn seed_rng(seed: u64) {
-    RNG_STATE.with(|state| {
-        *state.borrow_mut() = seed;
-    });
 }
 
 /// Sample from logits with temperature

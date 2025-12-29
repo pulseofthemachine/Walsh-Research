@@ -44,7 +44,9 @@ def quantize_to_bitmask_ternary(weight: torch.Tensor) -> tuple:
     
     This is smaller than packed format AND enables sparse iteration.
     """
-    w_ternary = torch.round(weight).clamp(-1, 1).flatten()
+    # BitNet b1.58 style quantization: round(W / absmean)
+    gamma = weight.abs().mean().item() + 1e-8
+    w_ternary = torch.round(weight / gamma).clamp(-1, 1).flatten()
     original_shape = weight.shape
     total = w_ternary.numel()
     
@@ -284,8 +286,17 @@ def compress_model(checkpoint_path: str, output_path: str, vocab_path: str = Non
                 
             elif '.beta' in name and 'head_mixer' not in name:
                 # Learnable scale (beta) - FP16 (but not head_mixer.beta, handled separately)
-                print(f"  [SCALE] {name}: {param_data.shape}")
+                print(f"  [SCALE_BETA] {name}: {param_data.shape}")
                 f.write(b'S')
+                name_bytes = name.encode('utf-8')
+                f.write(struct.pack('<H', len(name_bytes)))
+                f.write(name_bytes)
+                write_array(f, param_data.to(torch.float16).numpy(), 'f16')
+                
+            elif '.alpha' in name:
+                # Learnable input scale (alpha) - FP16 for Hadamard linear
+                print(f"  [SCALE_ALPHA] {name}: {param_data.shape}")
+                f.write(b'L')  # L for aLpha
                 name_bytes = name.encode('utf-8')
                 f.write(struct.pack('<H', len(name_bytes)))
                 f.write(name_bytes)

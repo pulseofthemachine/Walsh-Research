@@ -4,16 +4,20 @@ Walsh Loader - Load .walsh files back into PyTorch
 Loads compressed .walsh models for inference/verification in PyTorch.
 
 Supports all weight types:
-- B: Bitmask ternary weights (octonion linear layers)
+- B: Bitmask ternary weights (octonion/hadamard linear layers)
 - E: Embeddings (INT8 quantized)
 - S: Scale/beta parameters (FP16)
 - N: Norm weights (FP16)
 - R: RoPE frequencies (FP32 complex)
 - H: Head mixer weights (FP16)
 - h: Head mixer beta (FP16)
+- A: Hash table (INT8 quantized)
+- I: Hash importance (FP16)
+- J: Hash indices (INT32)
+- L: Alpha scale (FP16)
 
 Usage:
-    python generate_compressed.py inference/ckpt_v2.walsh --prompt "Once upon a time"
+    python generate_compressed.py inference/model.walsh --prompt "ROMEO:"
 """
 
 import argparse
@@ -22,6 +26,7 @@ import struct
 import numpy as np
 import torch
 import tiktoken
+import os
 from typing import Dict, Tuple, Any
 
 
@@ -107,9 +112,6 @@ def unpack_bitmask_ternary(bitmask: bytes, sign_bits: bytes,
 def load_walsh(path: str, verbose: bool = True) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     """
     Load a .walsh file and return state_dict + config.
-    
-    Returns:
-        (state_dict, config): Model weights and configuration
     """
     if verbose:
         print(f"Loading Walsh model from {path}")
@@ -125,8 +127,6 @@ def load_walsh(path: str, verbose: bool = True) -> Tuple[Dict[str, torch.Tensor]
         version = read_u16(f)
         if verbose:
             print(f"  Format version: {version}")
-        if version not in (3, 4):
-            raise ValueError(f"Unsupported version: {version} (expected 3 or 4)")
         
         # Config JSON
         config_len = read_u32(f)
@@ -138,10 +138,10 @@ def load_walsh(path: str, verbose: bool = True) -> Tuple[Dict[str, torch.Tensor]
         # === WEIGHT CHUNKS ===
         while True:
             marker = f.read(1)
-            if not marker:
+            if not marker or marker == b'\x00':
                 break
             
-            # Check for END marker
+            # Check for END marker (END!)
             if marker == b'E':
                 peek = f.read(3)
                 if peek == b'ND!':
@@ -199,13 +199,14 @@ def load_walsh(path: str, verbose: bool = True) -> Tuple[Dict[str, torch.Tensor]
                 # === ROPE - FP32 complex ===
                 data = read_array(f)
                 # data is [seq_len, dim/2, 2] (real/imag pairs)
-                tensor = torch.view_as_complex(torch.tensor(data))
+                # RoPE in chassis expects complex
+                tensor = torch.view_as_complex(torch.tensor(data).contiguous())
                 state_dict[name] = tensor
                 if verbose:
                     print(f"  [ROPE] {name}: {tensor.shape}")
                     
             elif marker == b'H':
-                # === HEAD MIXER WEIGHTS - FP16 [8, D, D] ===
+                # === HEAD MIXER WEIGHTS - FP16 [32/8, D, D] ===
                 data = read_array(f)
                 tensor = torch.tensor(data.astype(np.float32))
                 state_dict[name] = tensor
@@ -219,11 +220,43 @@ def load_walsh(path: str, verbose: bool = True) -> Tuple[Dict[str, torch.Tensor]
                 state_dict[name] = tensor
                 if verbose:
                     print(f"  [HEAD_MIXER_BETA] {name}: {tensor.shape}")
+                    
+            elif marker == b'A':
+                # === HASH TABLE (INT8 + scale) ===
+                scale = read_f32(f)
+                data = read_array(f)
+                tensor = torch.tensor(data.astype(np.float32) * scale)
+                state_dict[name] = tensor
+                if verbose:
+                    print(f"  [HASH_TABLE] {name}: {tensor.shape}")
+                    
+            elif marker == b'I':
+                # === HASH IMPORTANCE - FP16 ===
+                data = read_array(f)
+                tensor = torch.tensor(data.astype(np.float32))
+                state_dict[name] = tensor
+                if verbose:
+                    print(f"  [HASH_IMPORTANCE] {name}: {tensor.shape}")
+                    
+            elif marker == b'J':
+                # === HASH INDICES - INT32 ===
+                data = read_array(f)
+                tensor = torch.tensor(data.astype(np.int32))
+                state_dict[name] = tensor
+                if verbose:
+                    print(f"  [HASH_INDICES] {name}: {tensor.shape}")
+                    
+            elif marker == b'L':
+                # === ALPHA SCALE - FP16 ===
+                data = read_array(f)
+                tensor = torch.tensor(data.astype(np.float32))
+                state_dict[name] = tensor
+                if verbose:
+                    print(f"  [SCALE_ALPHA] {name}: {tensor.shape}")
                 
             else:
                 if verbose:
                     print(f"  [UNKNOWN] marker={marker}, name={name}")
-                # Try to skip unknown data gracefully
                 break
     
     return state_dict, config
@@ -249,36 +282,35 @@ def sample_from_walsh(walsh_path: str, prompt: str, max_tokens: int = 100,
     model_config = WalshConfig(**config)
     model = Walsh(model_config)
     
-    # Load state dict (strict=False to handle any missing buffers)
+    # Load state dict
+    # Strict=False because we skip some buffers like H matrix and precomputed indices if already there
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if verbose and missing:
-        print(f"  Missing keys: {missing}")
-    if verbose and unexpected:
-        print(f"  Unexpected keys: {unexpected}")
+    
+    if verbose:
+        if missing:
+            print(f"  Missing: {len(missing)} keys")
+        if unexpected:
+            print(f"  Unexpected: {len(unexpected)} keys")
     
     model.to(device).eval()
     
-    # Enable fused CUDA kernels for faster inference
-    if device == 'cuda':
-        try:
-            from src.model.cayley_dickson_cuda import optimize_for_inference
-            model = optimize_for_inference(model)
+    # Tokenizer
+    vocab_size = config.get('vocab_size', 50257)
+    if vocab_size == 65:
+        import pickle
+        meta_path = os.path.join(os.path.dirname(__file__), 'data/tinyshakespeare/meta.pkl')
+        if os.path.exists(meta_path):
+            with open(meta_path, 'rb') as f:
+                meta = pickle.load(f)
+            stoi, itos = meta['stoi'], meta['itos']
+            encode = lambda s: [stoi[c] for c in s if c in stoi]
+            decode = lambda l: ''.join([itos[idx] for idx in l])
             if verbose:
-                print("  Enabled fused CUDA kernels")
-        except ImportError:
-            pass
-    
-    # Tokenize
-    if config.get('vocab_size', 50257) <= 256:
-        # Char-level tokenizer
-        if verbose:
-            print("Using char-level tokenizer")
-        encode = lambda s: [ord(c) for c in s]
-        decode = lambda l: ''.join([chr(i) for i in l])
+                print(f"Using TinyShakespeare tokenizer ({meta_path})")
+        else:
+            encode = lambda s: [ord(c) for c in s]
+            decode = lambda l: ''.join([chr(i) for i in l])
     else:
-        # GPT-2 tokenizer
-        if verbose:
-            print("Using GPT-2 tokenizer")
         enc = tiktoken.get_encoding('gpt2')
         encode = lambda s: enc.encode(s, allowed_special=set(enc.special_tokens_set))
         decode = lambda l: enc.decode(l)
@@ -286,57 +318,23 @@ def sample_from_walsh(walsh_path: str, prompt: str, max_tokens: int = 100,
     tokens = encode(prompt)
     x = torch.tensor(tokens, device=device, dtype=torch.long)[None, ...]
     
-    # Generate
     print(f"\nPrompt: '{prompt}'")
     print("-" * 60)
     
-    import time
-    t0 = time.time()
     with torch.no_grad():
-        ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16) if device == 'cuda' else torch.no_grad()
-        with ctx:
+        with torch.amp.autocast(device_type=device, dtype=torch.bfloat16) if device == 'cuda' else torch.no_grad():
             y = model.generate(x, max_tokens, temperature=temperature, top_k=top_k)
-    t1 = time.time()
     
     output = decode(y[0].tolist())
-    tps = max_tokens / (t1 - t0)
-    
-    print(f"\nOutput ({tps:.1f} tok/s):")
-    print(output)
-    
+    print(f"\nOutput:\n{output}")
     return output
 
-
-# =============================================================================
-# CLI
-# =============================================================================
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Load and generate from .walsh model",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    python generate_compressed.py inference/ckpt_v2.walsh --prompt "Once upon a time"
-    python generate_compressed.py model.walsh --prompt "The quick brown" --max_tokens 50
-        """
-    )
+    parser = argparse.ArgumentParser(description="Verify .walsh model in PyTorch")
     parser.add_argument("walsh", help="Path to .walsh file")
-    parser.add_argument("--prompt", type=str, default="Once upon a time", help="Generation prompt")
-    parser.add_argument("--max_tokens", type=int, default=100, help="Max tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
-    parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling")
-    parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")
-    parser.add_argument("--quiet", action="store_true", help="Suppress loading messages")
+    parser.add_argument("--prompt", type=str, default="ROMEO:", help="Prompt")
+    parser.add_argument("--max_tokens", type=int, default=50, help="Tokens to generate")
+    parser.add_argument("--device", type=str, default="cuda", help="Device")
     
     args = parser.parse_args()
-    
-    sample_from_walsh(
-        args.walsh, 
-        args.prompt, 
-        args.max_tokens,
-        args.temperature,
-        args.top_k,
-        args.device,
-        verbose=not args.quiet
-    )
+    sample_from_walsh(args.walsh, args.prompt, args.max_tokens, device=args.device)

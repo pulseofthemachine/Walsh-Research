@@ -28,14 +28,6 @@ pub fn fht_32(x: &mut [f32; 32]) {
     }
 }
 
-/// Apply FHT to a slice of 32 elements (copies to fixed array, transforms, copies back)
-pub fn fht_32_slice(x: &mut [f32]) {
-    debug_assert!(x.len() == 32);
-    let mut arr: [f32; 32] = [0.0; 32];
-    arr.copy_from_slice(x);
-    fht_32(&mut arr);
-    x.copy_from_slice(&arr);
-}
 
 /// Hadamard linear multiplication for 32D algebra.
 /// 

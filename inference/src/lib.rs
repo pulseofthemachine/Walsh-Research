@@ -2,8 +2,8 @@
 //!
 //! Implements layer-by-layer chunked execution with singleton state.
 
-// Allow unused code for scaffolding/future use
-#![allow(dead_code, unused_variables, unused_mut)]
+// Allow unused variables/mut for now as we transition, but re-enable dead_code warnings
+#![allow(unused_variables, unused_mut)]
 
 mod model;
 mod octonion;
@@ -16,7 +16,7 @@ use std::cell::RefCell;
 
 use model::{WalshModel, KVCache};
 
-const MODEL_BYTES: &[u8] = include_bytes!("../ckpt_v2.walsh");
+const MODEL_BYTES: &[u8] = include_bytes!("../model.walsh");
 
 /// Generation state for chunked execution
 struct GenerationState {
@@ -33,15 +33,10 @@ struct ForwardState {
     new_len: usize,        // Number of new positions (1 after prompt)
     phase: ForwardPhase,
     kv_cache: Option<KVCache>,  // KV cache for efficient generation
-    // Scratchpad buffers (avoid allocations in hot loops)
-    scratch_norm: Vec<f32>,     // For normalized hidden states
-    scratch_ffn: Vec<f32>,      // For FFN intermediate activations
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum ForwardPhase {
-    Idle,
-    Embedding,
     Layers,
     FinalNorm,
     Done,
@@ -152,8 +147,6 @@ fn start_forward() -> String {
                                         new_len: 1,  // Just the new token
                                         phase: ForwardPhase::Layers,
                                         kv_cache: Some(cache),
-                                        scratch_norm: Vec::new(),
-                                        scratch_ffn: Vec::new(),
                                     });
                                     
                                     format!("Forward: cached, new_len=1")
@@ -170,8 +163,6 @@ fn start_forward() -> String {
                                         new_len: seq_len,  // All tokens are new
                                         phase: ForwardPhase::Layers,
                                         kv_cache: Some(cache),
-                                        scratch_norm: Vec::with_capacity(seq_len * model.config.n_embd),
-                                        scratch_ffn: Vec::with_capacity(seq_len * model.config.n_embd * 4),
                                     });
                                     
                                     format!("Forward: init, seq_len={}", seq_len)
@@ -382,8 +373,6 @@ fn generate_next_token() -> String {
                                         new_len: 0,
                                         phase: ForwardPhase::Done,
                                         kv_cache: Some(cache),
-                                        scratch_norm: Vec::new(),
-                                        scratch_ffn: Vec::new(),
                                     });
                                 });
                                 
@@ -473,8 +462,6 @@ fn generate_n_tokens(n: u32) -> String {
                                         new_len: 0,
                                         phase: ForwardPhase::Done,
                                         kv_cache: Some(cache),
-                                        scratch_norm: Vec::new(),
-                                        scratch_ffn: Vec::new(),
                                     });
                                 });
                                 
@@ -528,17 +515,6 @@ fn generation_status() -> String {
     })
 }
 
-/// Quick embedding-only generation
-#[query]
-fn generate_quick(prompt: String) -> String {
-    MODEL.with(|m| {
-        let model_ref = m.borrow();
-        match model_ref.as_ref() {
-            Some(model) => model.generate_simple(&prompt, 20).unwrap_or_else(|e| e),
-            None => "Error: No model".to_string(),
-        }
-    })
-}
 
 #[query]
 fn get_config() -> String {

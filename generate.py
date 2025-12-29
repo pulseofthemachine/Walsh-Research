@@ -74,9 +74,26 @@ def main():
         print("CUDA inference optimization enabled.")
 
     # Set up tokenizer based on vocab size
-    if config.vocab_size <= 256:
-        # Char-level tokenizer
-        print("Using char-level tokenizer")
+    if config.vocab_size == 65:
+        # TinyShakespeare (or other char-level with specific vocab)
+        print(f"Loading tokenizer from data/tinyshakespeare/meta.pkl...")
+        import pickle
+        try:
+            with open(f'data/tinyshakespeare/meta.pkl', 'rb') as f:
+                meta = pickle.load(f)
+            stoi, itos = meta['stoi'], meta['itos']
+            encode = lambda s: [stoi.get(c, 0) for c in s]
+            decode = lambda l: ''.join([itos.get(i, '?') for i in l])
+        except FileNotFoundError:
+             # Generice fallback if meta.pkl is missing
+            print("meta.pkl not found, using generic char-level tokenizer")
+            stoi = {chr(i): i for i in range(256)}
+            itos = {i: chr(i) for i in range(256)}
+            encode = lambda s: [stoi.get(c, 0) for c in s]
+            decode = lambda l: ''.join([itos.get(i, '?') for i in l])
+    elif config.vocab_size <= 256:
+        # Generic char-level tokenizer fallback
+        print("Using generic char-level tokenizer")
         stoi = {chr(i): i for i in range(256)}
         itos = {i: chr(i) for i in range(256)}
         encode = lambda s: [stoi.get(c, 0) for c in s]

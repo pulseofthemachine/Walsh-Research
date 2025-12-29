@@ -1,0 +1,20 @@
+service : {
+    // Full generation (fast path)
+    generate_full : (text, nat32) -> (text);
+    
+    // Layer-by-layer chunked generation
+    start_generation : (text, nat32) -> (text);
+    start_forward : () -> (text);
+    process_layers : (nat32) -> (text);
+    finish_forward : () -> (text);
+    generate_next_token : () -> (text);
+    generate_n_tokens : (nat32) -> (text);
+    
+    // Status and results
+    get_result : () -> (text) query;
+    generation_status : () -> (text) query;
+    
+    
+    // Config
+    get_config : () -> (text) query;
+}
