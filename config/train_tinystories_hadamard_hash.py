@@ -1,4 +1,4 @@
-# SpinNet TinyStories Config - Hadamard 32D with Hash Embeddings
+# Walsh TinyStories Config - Hadamard 32D with Hash Embeddings
 # Ultra-compressed: ~2M total params (13x smaller than standard)
 #
 # This config combines:
@@ -25,7 +25,7 @@ dropout = 0.0
 bias = False
 vocab_size = 50257   # GPT-2 tokenizer
 
-# SpinNet-specific
+# Walsh-specific
 algebra = "hadamard"     # Use 32D Hadamard algebra (O(n log n) mixing)
 head_mixing = True       # Enable Hadamard head mixing
 hash_embeddings = True   # Use composite hash embeddings (25x compression)

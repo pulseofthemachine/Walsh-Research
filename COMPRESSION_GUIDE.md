@@ -1,14 +1,14 @@
-# SpinNet Compression Guide
+# Walsh Compression Guide
 
-This guide covers how to compress SpinNet models for efficient storage and deployment using a TinyStories-trained model as an example.
+This guide covers how to compress Walsh models for efficient storage and deployment using a TinyStories-trained model as an example.
 
 CURRENTLY SUPPORTS OCTONION (8D) ONLY
 
 ## Overview
 
-The compression pipeline converts PyTorch checkpoints (`.pt`) to optimized `.spinnet` format:
+The compression pipeline converts PyTorch checkpoints (`.pt`) to optimized `.walsh` format:
 
-| Metric | ckpt.pt | model.spinnet |
+| Metric | ckpt.pt | model.walsh |
 |--------|---------|---------------|
 | **File size** | 334 MB | 26 MB (7.7%) |
 | **GPU memory** | 445 MB | 120 MB (27%) |
@@ -20,18 +20,18 @@ The compression pipeline converts PyTorch checkpoints (`.pt`) to optimized `.spi
 ### 1. Compress a Trained Model
 
 ```bash
-python compress.py experiments/out-tinystories-octonion/ckpt.pt -o model.spinnet
+python compress.py experiments/out-tinystories-octonion/ckpt.pt -o model.walsh
 ```
 
 ### 2. Generate from Compressed Model
 
 ```bash
-python generate_compressed.py model.spinnet --prompt "Once upon a time" --max_tokens 100
+python generate_compressed.py model.walsh --prompt "Once upon a time" --max_tokens 100
 ```
 
 ## Format Details
 
-The `.spinnet` format uses multiple compression techniques:
+The `.walsh` format uses multiple compression techniques:
 
 ### Weight Types
 
@@ -51,23 +51,23 @@ For ternary weights (`{-1, 0, +1}`), we use bitmask + sign encoding:
 - **Bitmask**: 1 bit per position (1 = non-zero)
 - **Sign bits**: 1 bit per non-zero (0 = -1, 1 = +1)
 
-At ~90% sparsity (typical for trained SpinNet), this is much smaller than 2-bit packed format.
+At ~90% sparsity (typical for trained Walsh), this is much smaller than 2-bit packed format.
 
 ## Usage Examples
 
 ### Basic Generation
 ```bash
-python generate_compressed.py model.spinnet --prompt "Hello world"
+python generate_compressed.py model.walsh --prompt "Hello world"
 ```
 
 ### Quiet Mode (suppress loading logs)
 ```bash
-python generate_compressed.py model.spinnet --prompt "Hello" --quiet
+python generate_compressed.py model.walsh --prompt "Hello" --quiet
 ```
 
 ### Custom Parameters
 ```bash
-python generate_compressed.py model.spinnet \
+python generate_compressed.py model.walsh \
     --prompt "The scientist discovered" \
     --max_tokens 200 \
     --temperature 0.9 \
@@ -76,20 +76,20 @@ python generate_compressed.py model.spinnet \
 
 ### CPU Inference
 ```bash
-python generate_compressed.py model.spinnet --prompt "Hello" --device cpu
+python generate_compressed.py model.walsh --prompt "Hello" --device cpu
 ```
 
 ## Python API
 
 ```python
-from generate_compressed import load_spinnet
-from src.model import SpinNet, SpinNetConfig
+from generate_compressed import load_walsh
+from src.model import Walsh, WalshConfig
 
 # Load compressed model
-state_dict, config = load_spinnet("model.spinnet")
+state_dict, config = load_walsh("model.walsh")
 
 # Create and initialize model
-model = SpinNet(SpinNetConfig(**config))
+model = Walsh(WalshConfig(**config))
 model.load_state_dict(state_dict, strict=False)
 model.to("cuda").eval()
 
@@ -99,11 +99,11 @@ tokens = model.generate(prompt_ids, max_new_tokens=100)
 
 ## ICP Deployment
 
-For Internet Computer deployment, the `.spinnet` format is loaded by the Rust inference engine:
+For Internet Computer deployment, the `.walsh` format is loaded by the Rust inference engine:
 
 ```bash
 # Compress
-python compress.py experiments/out-tinystories-octonion/ckpt.pt -o inference/ckpt_v2.spinnet
+python compress.py experiments/out-tinystories-octonion/ckpt.pt -o inference/ckpt_v2.walsh
 
 # Deploy
 cd inference

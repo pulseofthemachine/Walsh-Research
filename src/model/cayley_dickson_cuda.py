@@ -1,5 +1,5 @@
 """
-SpinNet: Fused Cayley-Dickson Octonion CUDA Kernel
+Walsh: Fused Cayley-Dickson Octonion CUDA Kernel
 ---------------------------------------------------
 Optimized Triton kernel for octonion algebra multiplication.
 Reduces 64 separate matmul kernel launches to a single fused kernel.
@@ -588,7 +588,7 @@ def cayley_dickson_fused(x_parts, weight):
     # ---------------------------------------------------------
     # Zero-Copy Optimization for Interleaved Inputs
     # ---------------------------------------------------------
-    # Check if inputs are views of a single interleaved tensor (common in SpinNet)
+    # Check if inputs are views of a single interleaved tensor (common in Walsh)
     # This avoids generic stack() which copies memory.
     x0 = x_parts[0].view(-1, K)
     use_fast_path = False
@@ -777,19 +777,19 @@ class OctonionPackedLinear(nn.Module):
 
 def optimize_for_inference(model):
     """
-    Convert a SpinNet model to use fused CUDA kernels for faster inference.
+    Convert a Walsh model to use fused CUDA kernels for faster inference.
     
     This replaces all OctonionTernaryLinear layers with OctonionFusedLinear,
     providing ~5x speedup for inference while maintaining identical outputs.
     
     Usage:
-        model = SpinNet(config)
+        model = Walsh(config)
         model.load_state_dict(checkpoint['model'])
         model = optimize_for_inference(model)  # 5x faster!
         model.eval()
     
     Args:
-        model: A SpinNet model with OctonionTernaryLinear layers
+        model: A Walsh model with OctonionTernaryLinear layers
         
     Returns:
         The same model with layers swapped for fast inference

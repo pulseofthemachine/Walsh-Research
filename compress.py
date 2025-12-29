@@ -1,9 +1,9 @@
 """
-SpinNet Model Compression Script
+Walsh Model Compression Script
 ---------------------------------
 Converts a PyTorch checkpoint to optimized binary format for Rust inference.
 
-Output format (.spinnet v2):
+Output format (.walsh v2):
 - Header: model config (JSON)
 - Embeddings: INT8 quantized
 - Ternary weights: PACKED format (4 values per byte = 16x smaller)
@@ -118,7 +118,7 @@ def write_array(f, arr: np.ndarray, dtype_code: str):
 
 def compress_model(checkpoint_path: str, output_path: str, vocab_path: str = None):
     """
-    Compress a SpinNet checkpoint to .spinnet format.
+    Compress a Walsh checkpoint to .walsh format.
     """
     print(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -167,16 +167,24 @@ def compress_model(checkpoint_path: str, output_path: str, vocab_path: str = Non
         if tied_embeddings:
             print("  [INFO] Detected tied embeddings - skipping output.weight")
         
+        # Check for hash embeddings (multiple tables instead of single embedding)
+        has_hash_embeddings = any('tok_embeddings.emb_tables' in name for name in state_dict.keys())
+        if has_hash_embeddings:
+            print("  [INFO] Detected hash embeddings - exporting tables and importance weights")
+        
+        # Detect algebra type (32D hadamard vs 8D octonion)
+        algebra = model_args.get('algebra', 'octonion')
+        print(f"  [INFO] Algebra type: {algebra}")
+        
         for name, param in state_dict.items():
             param_data = param.detach()
             
             # Determine parameter type
-            if 'tok_embeddings' in name or 'output.weight' in name:
-                # Skip output.weight if embeddings are tied (saved in tok_embeddings)
+            if 'tok_embeddings.weight' in name and not has_hash_embeddings:
+                # Standard embedding layer - INT8 quantize
                 if name == 'output.weight' and tied_embeddings:
                     print(f"  [SKIP] {name}: tied to tok_embeddings")
                     continue
-                # Embedding layer - INT8 quantize
                 print(f"  [EMBED] {name}: {param_data.shape}")
                 quantized, scale = quantize_embedding(param_data)
                 
@@ -187,6 +195,54 @@ def compress_model(checkpoint_path: str, output_path: str, vocab_path: str = Non
                 f.write(name_bytes)
                 
                 # Write scale + data
+                f.write(struct.pack('<f', scale))
+                write_array(f, quantized, 'i8')
+                embed_count += 1
+                
+            elif 'tok_embeddings.emb_tables' in name and '.weight' in name:
+                # Hash embedding table (one of 3) - INT8 quantize
+                print(f"  [HASH_TABLE] {name}: {param_data.shape}")
+                quantized, scale = quantize_embedding(param_data)
+                
+                f.write(b'A')  # Hash table marker (A for table Array)
+                name_bytes = name.encode('utf-8')
+                f.write(struct.pack('<H', len(name_bytes)))
+                f.write(name_bytes)
+                
+                f.write(struct.pack('<f', scale))
+                write_array(f, quantized, 'i8')
+                embed_count += 1
+                
+            elif 'tok_embeddings.importance' in name:
+                # Hash importance weights - FP16
+                print(f"  [HASH_IMPORTANCE] {name}: {param_data.shape}")
+                f.write(b'I')  # Importance marker
+                name_bytes = name.encode('utf-8')
+                f.write(struct.pack('<H', len(name_bytes)))
+                f.write(name_bytes)
+                write_array(f, param_data.to(torch.float16).numpy(), 'f16')
+                
+            elif 'tok_embeddings.all_indices' in name:
+                # Precomputed hash indices - INT32
+                print(f"  [HASH_INDICES] {name}: {param_data.shape}")
+                f.write(b'J')  # Indices marker (J for inJices lol)
+                name_bytes = name.encode('utf-8')
+                f.write(struct.pack('<H', len(name_bytes)))
+                f.write(name_bytes)
+                write_array(f, param_data.to(torch.int32).numpy(), 'i32')
+                
+            elif 'output.weight' in name:
+                # Skip for hash embeddings (uses projection method), or if tied
+                if has_hash_embeddings or tied_embeddings:
+                    print(f"  [SKIP] {name}: using hash projection")
+                    continue
+                # Standard output layer
+                print(f"  [EMBED] {name}: {param_data.shape}")
+                quantized, scale = quantize_embedding(param_data)
+                f.write(b'E')
+                name_bytes = name.encode('utf-8')
+                f.write(struct.pack('<H', len(name_bytes)))
+                f.write(name_bytes)
                 f.write(struct.pack('<f', scale))
                 write_array(f, quantized, 'i8')
                 embed_count += 1
@@ -292,15 +348,15 @@ def compress_model(checkpoint_path: str, output_path: str, vocab_path: str = Non
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compress SpinNet model for Rust inference")
+    parser = argparse.ArgumentParser(description="Compress Walsh model for Rust inference")
     parser.add_argument("checkpoint", help="Path to PyTorch checkpoint (.pt)")
-    parser.add_argument("-o", "--output", default=None, help="Output path (.spinnet)")
+    parser.add_argument("-o", "--output", default=None, help="Output path (.walsh)")
     parser.add_argument("--vocab", default=None, help="Path to tokenizer vocab (optional)")
     
     args = parser.parse_args()
     
     output = args.output
     if output is None:
-        output = Path(args.checkpoint).with_suffix('.spinnet')
+        output = Path(args.checkpoint).with_suffix('.walsh')
     
     compress_model(args.checkpoint, output, args.vocab)

@@ -1,8 +1,8 @@
 [package]
-name = "spinnet-inference"
+name = "walsh-inference"
 version = "0.1.0"
 edition = "2021"
-description = "SpinNet inference engine for Internet Computer"
+description = "Walsh inference engine for Internet Computer"
 
 [lib]
 crate-type = ["cdylib"]

@@ -1,1 +1,1 @@
-from .chassis import SpinNet, SpinNetConfig, KVCache
+from .chassis import Walsh, WalshConfig, KVCache

@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SpinNet Inference</title>
+    <title>Walsh Inference</title>
     <style>
         :root {
             --bg: #0a0a0f;
@@ -153,7 +153,7 @@
 </head>
 
 <body>
-    <h1>SpinNet</h1>
+    <h1>Walsh</h1>
     <p class="subtitle">Ternary-Octonion Language Model on Internet Computer</p>
 
     <div class="container">
@@ -272,7 +272,7 @@
                 status.innerHTML = `
                     To generate text, run in terminal:<br>
                     <code style="background:#1a1a2e;padding:4px 8px;border-radius:4px;">
-                    dfx canister call spinnet_backend generate '("${prompt.replace(/"/g, '\\"').replace(/\n/g, '\\n')}")'
+                    dfx canister call walsh_backend generate '("${prompt.replace(/"/g, '\\"').replace(/\n/g, '\\n')}")'
                     </code>
                 `;
 
@@ -284,8 +284,8 @@ the @dfinity/agent library for direct calls, which we haven't
 bundled yet.
 
 Quick test:
-  dfx canister call spinnet_backend get_config
-  dfx canister call spinnet_backend generate '("Hello")'
+  dfx canister call walsh_backend get_config
+  dfx canister call walsh_backend generate '("Hello")'
                 </span>`;
 
             } catch (error) {
@@ -299,7 +299,7 @@ Quick test:
         // Load config on page load
         async function loadConfig() {
             const configEl = document.getElementById('config');
-            configEl.textContent = `Canister: ${CANISTER_ID} | Model: SpinNet (Ternary-Octonion)`;
+            configEl.textContent = `Canister: ${CANISTER_ID} | Model: Walsh (Ternary-Octonion)`;
         }
 
         loadConfig();

@@ -1,7 +1,7 @@
 """
-SpinNet Loader - Load .spinnet files back into PyTorch
+Walsh Loader - Load .walsh files back into PyTorch
 -------------------------------------------------------
-Loads compressed .spinnet models for inference/verification in PyTorch.
+Loads compressed .walsh models for inference/verification in PyTorch.
 
 Supports all weight types:
 - B: Bitmask ternary weights (octonion linear layers)
@@ -13,7 +13,7 @@ Supports all weight types:
 - h: Head mixer beta (FP16)
 
 Usage:
-    python generate_compressed.py inference/ckpt_v2.spinnet --prompt "Once upon a time"
+    python generate_compressed.py inference/ckpt_v2.walsh --prompt "Once upon a time"
 """
 
 import argparse
@@ -104,15 +104,15 @@ def unpack_bitmask_ternary(bitmask: bytes, sign_bits: bytes,
 # MAIN LOADER
 # =============================================================================
 
-def load_spinnet(path: str, verbose: bool = True) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+def load_walsh(path: str, verbose: bool = True) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     """
-    Load a .spinnet file and return state_dict + config.
+    Load a .walsh file and return state_dict + config.
     
     Returns:
         (state_dict, config): Model weights and configuration
     """
     if verbose:
-        print(f"Loading SpinNet model from {path}")
+        print(f"Loading Walsh model from {path}")
     
     state_dict = {}
     
@@ -233,21 +233,21 @@ def load_spinnet(path: str, verbose: bool = True) -> Tuple[Dict[str, torch.Tenso
 # GENERATION
 # =============================================================================
 
-def sample_from_spinnet(spinnet_path: str, prompt: str, max_tokens: int = 100,
+def sample_from_walsh(walsh_path: str, prompt: str, max_tokens: int = 100,
                         temperature: float = 0.8, top_k: int = 50,
                         device: str = 'cuda', verbose: bool = True):
-    """Load a .spinnet and generate text."""
+    """Load a .walsh and generate text."""
     import sys
     import os
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from src.model import SpinNetConfig, SpinNet
+    from src.model import WalshConfig, Walsh
     
     # Load weights
-    state_dict, config = load_spinnet(spinnet_path, verbose=verbose)
+    state_dict, config = load_walsh(walsh_path, verbose=verbose)
     
     # Create model
-    model_config = SpinNetConfig(**config)
-    model = SpinNet(model_config)
+    model_config = WalshConfig(**config)
+    model = Walsh(model_config)
     
     # Load state dict (strict=False to handle any missing buffers)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -313,15 +313,15 @@ def sample_from_spinnet(spinnet_path: str, prompt: str, max_tokens: int = 100,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Load and generate from .spinnet model",
+        description="Load and generate from .walsh model",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python generate_compressed.py inference/ckpt_v2.spinnet --prompt "Once upon a time"
-    python generate_compressed.py model.spinnet --prompt "The quick brown" --max_tokens 50
+    python generate_compressed.py inference/ckpt_v2.walsh --prompt "Once upon a time"
+    python generate_compressed.py model.walsh --prompt "The quick brown" --max_tokens 50
         """
     )
-    parser.add_argument("spinnet", help="Path to .spinnet file")
+    parser.add_argument("walsh", help="Path to .walsh file")
     parser.add_argument("--prompt", type=str, default="Once upon a time", help="Generation prompt")
     parser.add_argument("--max_tokens", type=int, default=100, help="Max tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
@@ -331,8 +331,8 @@ Examples:
     
     args = parser.parse_args()
     
-    sample_from_spinnet(
-        args.spinnet, 
+    sample_from_walsh(
+        args.walsh, 
         args.prompt, 
         args.max_tokens,
         args.temperature,

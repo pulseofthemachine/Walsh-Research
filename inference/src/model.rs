@@ -1,15 +1,31 @@
-//! SpinNet Model Loading and Inference
+//! Walsh Model Loading and Inference
 //!
 //! Full implementation with weight parsing and transformer forward pass.
+//! Supports both 8D Octonion and 32D Hadamard algebra modes.
 
 use crate::attention::{rms_norm, attention, attention_cached, silu};
 use crate::tokenizer::Tokenizer;
 
-/// SpinNet model container
-pub struct SpinNetModel {
+/// Hash embedding for ultra-compressed vocab representation
+/// Uses 3 embedding tables with learned importance weights
+pub struct HashEmbedding {
+    tables: Vec<Vec<f32>>,      // 3 tables: [bucket_size, n_embd] each
+    table_scales: Vec<f32>,     // INT8 dequantization scales per table
+    importance: Vec<f32>,       // [vocab_size, 3] learned weights per token/table
+    indices: Vec<i32>,          // [vocab_size, 3] precomputed hash indices
+    bucket_size: usize,
+    num_tables: usize,
+    n_embd: usize,
+}
+
+/// Walsh model container
+pub struct WalshModel {
     pub config: ModelConfig,
+    // Standard embeddings (for octonion/non-hash models)
     embeddings: Vec<f32>,              // [vocab_size, n_embd]
     embed_scale: f32,
+    // Hash embeddings (for hadamard + hash_embeddings=true)
+    hash_embedding: Option<HashEmbedding>,
     layers: Vec<TransformerLayer>,
     final_norm: Vec<f32>,              // RMSNorm weights
     rope_cos: Vec<f32>,                // [block_size, head_dim/2]
@@ -24,6 +40,8 @@ pub struct ModelConfig {
     pub n_layer: usize,
     pub n_head: usize,
     pub block_size: usize,
+    pub algebra: String,           // "octonion" (8D) or "hadamard" (32D)
+    pub hash_embeddings: bool,     // Use hash embedding tables
 }
 
 /// Bitmask ternary weight - smallest format with sparse iteration
@@ -84,7 +102,7 @@ impl KVCache {
     }
 }
 
-impl SpinNetModel {
+impl WalshModel {
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
         if data.len() < 10 {
             return Err("File too small".to_string());
@@ -122,6 +140,11 @@ impl SpinNetModel {
         let mut rope_cos = Vec::new();
         let mut rope_sin = Vec::new();
         let mut layers: Vec<TransformerLayer> = Vec::new();
+        
+        // Hash embedding storage (for hadamard + hash_embeddings mode)
+        let mut hash_tables: Vec<(String, Vec<f32>, f32)> = Vec::new();  // (name, data, scale)
+        let mut hash_importance: Vec<f32> = Vec::new();
+        let mut hash_indices: Vec<i32> = Vec::new();
         
         // Weight name -> data storage
         let mut bitmask_weights: std::collections::HashMap<String, BitmaskWeight> = std::collections::HashMap::new();
@@ -264,6 +287,26 @@ impl SpinNetModel {
                     let arr = read_array_f16_as_f32(data, &mut cursor)?;
                     head_mixer_beta_raw.insert(name, arr);
                 }
+                b'A' => {
+                    // Hash embedding table - INT8 with scale
+                    let name = read_name(data, &mut cursor)?;
+                    let scale = read_f32(data, &mut cursor)?;
+                    let arr = read_array_i8(data, &mut cursor)?;
+                    let arr_f32: Vec<f32> = arr.iter().map(|&x| x as f32 * scale).collect();
+                    hash_tables.push((name, arr_f32, scale));
+                }
+                b'I' => {
+                    // Hash importance weights - FP16
+                    let _name = read_name(data, &mut cursor)?;
+                    let arr = read_array_f16_as_f32(data, &mut cursor)?;
+                    hash_importance = arr;
+                }
+                b'J' => {
+                    // Hash indices - INT32
+                    let _name = read_name(data, &mut cursor)?;
+                    let arr = read_array_i32(data, &mut cursor)?;
+                    hash_indices = arr;
+                }
                 _ => {
                     // Skip unknown marker
                     if cursor < data.len() {
@@ -345,8 +388,34 @@ impl SpinNetModel {
         // Create auto-detecting tokenizer based on vocab_size
         let tokenizer = Tokenizer::new(config.vocab_size);
         
-        // Set default embeddings if not loaded
-        if embeddings.is_empty() {
+        // Build hash embedding if we loaded hash tables
+        let hash_embedding = if !hash_tables.is_empty() && hash_tables.len() == 3 {
+            // Sort tables by name to ensure consistent ordering
+            let mut sorted_tables: Vec<_> = hash_tables.into_iter().collect();
+            sorted_tables.sort_by(|a, b| a.0.cmp(&b.0));
+            
+            // Determine bucket size from first table
+            let bucket_size = sorted_tables[0].1.len() / config.n_embd;
+            let num_tables = 3;
+            
+            let tables: Vec<Vec<f32>> = sorted_tables.iter().map(|(_, data, _)| data.clone()).collect();
+            let table_scales: Vec<f32> = sorted_tables.iter().map(|(_, _, scale)| *scale).collect();
+            
+            Some(HashEmbedding {
+                tables,
+                table_scales,
+                importance: hash_importance,
+                indices: hash_indices,
+                bucket_size,
+                num_tables,
+                n_embd: config.n_embd,
+            })
+        } else {
+            None
+        };
+        
+        // Set default embeddings if not loaded and not using hash
+        if embeddings.is_empty() && hash_embedding.is_none() {
             embeddings = vec![0.0; config.vocab_size * config.n_embd];
             for v in 0..config.vocab_size {
                 for e in 0..config.n_embd {
@@ -359,10 +428,11 @@ impl SpinNetModel {
             final_norm = vec![1.0; config.n_embd];
         }
         
-        Ok(SpinNetModel {
+        Ok(WalshModel {
             config,
             embeddings,
             embed_scale,
+            hash_embedding,
             layers,
             final_norm,
             rope_cos,
@@ -415,16 +485,70 @@ impl SpinNetModel {
         let n_embd = self.config.n_embd;
         let mut h = vec![0.0f32; tokens.len() * n_embd];
         
-        for (t, &tok) in tokens.iter().enumerate() {
-            let tok = tok % self.config.vocab_size;
-            let start = tok * n_embd;
-            for i in 0..n_embd {
-                if start + i < self.embeddings.len() {
-                    h[t * n_embd + i] = self.embeddings[start + i];
+        // Use hash embeddings if available
+        if let Some(ref hash_emb) = self.hash_embedding {
+            for (t, &tok) in tokens.iter().enumerate() {
+                let tok = tok % self.config.vocab_size;
+                let emb = self.hash_embed_single(hash_emb, tok);
+                for i in 0..n_embd {
+                    h[t * n_embd + i] = emb[i];
+                }
+            }
+        } else {
+            // Standard embedding lookup
+            for (t, &tok) in tokens.iter().enumerate() {
+                let tok = tok % self.config.vocab_size;
+                let start = tok * n_embd;
+                for i in 0..n_embd {
+                    if start + i < self.embeddings.len() {
+                        h[t * n_embd + i] = self.embeddings[start + i];
+                    }
                 }
             }
         }
         h
+    }
+    
+    /// Hash embedding lookup for a single token
+    fn hash_embed_single(&self, hash_emb: &HashEmbedding, tok: usize) -> Vec<f32> {
+        let n_embd = hash_emb.n_embd;
+        let num_tables = hash_emb.num_tables;
+        let mut result = vec![0.0f32; n_embd];
+        
+        // Get importance weights for this token: [num_tables]
+        let imp_base = tok * num_tables;
+        
+        // Sum weighted vectors from each table
+        for table_idx in 0..num_tables {
+            // Get precomputed hash index for this token/table: indices[tok * num_tables + table_idx]
+            let indices_idx = tok * num_tables + table_idx;
+            if indices_idx >= hash_emb.indices.len() { continue; }
+            let bucket_idx = hash_emb.indices[indices_idx] as usize;
+            if bucket_idx >= hash_emb.bucket_size { continue; }
+            
+            // Get importance weight
+            let imp = if imp_base + table_idx < hash_emb.importance.len() {
+                hash_emb.importance[imp_base + table_idx]
+            } else {
+                1.0
+            };
+            
+            // Add weighted embedding from table
+            let emb_start = bucket_idx * n_embd;
+            for i in 0..n_embd {
+                if emb_start + i < hash_emb.tables[table_idx].len() {
+                    result[i] += imp * hash_emb.tables[table_idx][emb_start + i];
+                }
+            }
+        }
+        
+        // Scale by sqrt(n_embd) as in Python
+        let scale = (n_embd as f32).sqrt();
+        for v in result.iter_mut() {
+            *v *= scale;
+        }
+        
+        result
     }
     
     /// Run a single transformer layer (for chunked execution)
@@ -596,14 +720,28 @@ impl SpinNetModel {
         // RMSNorm
         let normed = rms_norm(last_hidden, &self.final_norm, 1e-6);
         
-        // Output projection (tied embeddings)
+        // Output projection
         let mut logits = vec![0.0f32; self.config.vocab_size];
-        for v in 0..self.config.vocab_size {
-            let mut dot = 0.0f32;
-            for i in 0..n_embd {
-                dot += normed[i] * self.embeddings[v * n_embd + i];
+        
+        if let Some(ref hash_emb) = self.hash_embedding {
+            // Hash embedding output projection: dot product with reconstructed embeddings
+            for v in 0..self.config.vocab_size {
+                let emb = self.hash_embed_single(hash_emb, v);
+                let mut dot = 0.0f32;
+                for i in 0..n_embd {
+                    dot += normed[i] * emb[i];
+                }
+                logits[v] = dot;
             }
-            logits[v] = dot;
+        } else {
+            // Standard tied embeddings
+            for v in 0..self.config.vocab_size {
+                let mut dot = 0.0f32;
+                for i in 0..n_embd {
+                    dot += normed[i] * self.embeddings[v * n_embd + i];
+                }
+                logits[v] = dot;
+            }
         }
         
         sample_with_temperature(&logits, 0.8)
@@ -1153,12 +1291,42 @@ fn parse_config(json: &str) -> Result<ModelConfig, String> {
         rest[..end].trim().parse().ok()
     };
     
+    // Extract string values for algebra
+    let extract_str = |key: &str| -> Option<String> {
+        let pattern = format!("\"{}\":", key);
+        let start = json.find(&pattern)? + pattern.len();
+        let rest = &json[start..].trim_start();
+        if rest.starts_with('"') {
+            let rest = &rest[1..];
+            let end = rest.find('"')?;
+            Some(rest[..end].to_string())
+        } else {
+            None
+        }
+    };
+    
+    // Extract boolean values
+    let extract_bool = |key: &str| -> Option<bool> {
+        let pattern = format!("\"{}\":", key);
+        let start = json.find(&pattern)? + pattern.len();
+        let rest = &json[start..].trim_start();
+        if rest.starts_with("true") {
+            Some(true)
+        } else if rest.starts_with("false") {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    
     Ok(ModelConfig {
         vocab_size: extract("vocab_size").unwrap_or(65),
         n_embd: extract("n_embd").unwrap_or(256),
         n_layer: extract("n_layer").unwrap_or(8),
         n_head: extract("n_head").unwrap_or(8),
         block_size: extract("block_size").unwrap_or(512),
+        algebra: extract_str("algebra").unwrap_or_else(|| "octonion".to_string()),
+        hash_embeddings: extract_bool("hash_embeddings").unwrap_or(false),
     })
 }
 

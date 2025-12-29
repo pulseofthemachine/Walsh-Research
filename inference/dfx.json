@@ -1,11 +1,11 @@
 {
     "canisters": {
-        "spinnet_backend": {
+        "walsh_backend": {
             "type": "rust",
-            "candid": "src/spinnet_backend.did",
-            "package": "spinnet-inference"
+            "candid": "src/walsh_backend.did",
+            "package": "walsh-inference"
         },
-        "spinnet_frontend": {
+        "walsh_frontend": {
             "type": "assets",
             "source": [
                 "frontend"

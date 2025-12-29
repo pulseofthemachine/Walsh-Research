@@ -13,18 +13,18 @@ echo ""
 
 # 1. Start Generation
 echo "Starting generation..."
-START_RESULT=$(dfx canister call spinnet_backend start_generation "(\"$PROMPT\", $((N+10)))")
+START_RESULT=$(dfx canister call walsh_backend start_generation "(\"$PROMPT\", $((N+10)))")
 echo "$START_RESULT"
 
 # 2. Start Forward (Prompt)
 echo "Start forward..."
-dfx canister call spinnet_backend start_forward
+dfx canister call walsh_backend start_forward
 
 # 3. Process Layers (Prompt) - loop until done
 echo "Processing prompt layers..."
 STATUS="Layer"
 while [[ "$STATUS" != *"Done"* ]]; do
-  STATUS=$(dfx canister call spinnet_backend process_layers '(8)')
+  STATUS=$(dfx canister call walsh_backend process_layers '(8)')
   echo "  $STATUS"
   
   if [[ "$STATUS" == *"Error"* ]]; then
@@ -35,7 +35,7 @@ done
 
 # 4. Finish Forward (Sample first token)
 echo "Finish forward (First token)..."
-FIRST_TOKEN=$(dfx canister call spinnet_backend finish_forward | sed 's/(\"//;s/\")//')
+FIRST_TOKEN=$(dfx canister call walsh_backend finish_forward | sed 's/(\"//;s/\")//')
 echo "Token 1: $FIRST_TOKEN"
 
 # 5. Generate N Tokens with Adaptive Looping
@@ -49,7 +49,7 @@ while [ $GENERATED -lt $N ]; do
     REMAINING=$((N - GENERATED))
     
     # Request remaining tokens (will get partial if budget exceeded)
-    RAW=$(dfx canister call spinnet_backend generate_n_tokens "($REMAINING)")
+    RAW=$(dfx canister call walsh_backend generate_n_tokens "($REMAINING)")
     
     # Extract just the text (remove candid wrapping)
     CHUNK=$(echo "$RAW" | sed 's/(\"//;s/\")//;s/\\n/\n/g')

@@ -31,7 +31,7 @@ except ImportError:
     pass
 
 @dataclass
-class SpinNetConfig:
+class WalshConfig:
     block_size: int = 256
     vocab_size: int = 65  
     n_layer: int = 6
@@ -44,7 +44,7 @@ class SpinNetConfig:
     hash_embeddings: bool = False  # Use composite hash embeddings (25x compression)
 
 
-def get_linear_layer(config: SpinNetConfig):
+def get_linear_layer(config: WalshConfig):
     """Get the appropriate linear layer class based on algebra config.
     
     Returns:
@@ -58,7 +58,7 @@ def get_linear_layer(config: SpinNetConfig):
         return OctonionTernaryLinear, 8
 
 
-def get_head_mixer(config: SpinNetConfig, head_dim: int):
+def get_head_mixer(config: WalshConfig, head_dim: int):
     """Get the appropriate head mixer based on algebra config.
     
     Auto-detects whether to use Octonion (8-head) or Hadamard (32-head) mixing.
@@ -512,7 +512,7 @@ class LlamaBlock(nn.Module):
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
-class SpinNet(nn.Module):
+class Walsh(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config

@@ -1,8 +1,8 @@
-# SpinNet (Research Preview)
+# Walsh
 
 **Status:** `EXPERIMENTAL` / `ACTIVE DEV`
 
-SpinNet is an exploratory architecture combining **1.58-bit (Ternary) Quantization** (à la BitNet) with **Hyper-Complex Algebras**. We replace standard linear layers with **Octonion (8D)** or **Hadamard (32D)** multiplications, compressing the "brain" of the model by 8/32x while maintaining expressivity through structured geometric mixing.
+Walsh is an exploratory architecture combining **1.58-bit (Ternary) Quantization** (à la BitNet) with **Hyper-Complex Algebras**. We replace standard linear layers with **Octonion (8D)** or **Hadamard (32D)** multiplications, compressing the "brain" of the model by 8/32x while maintaining expressivity through structured geometric mixing.
 
 Currently running on **CUDA** (via custom Triton kernels) and **WebAssembly** (on the Internet Computer blockchain).
 
@@ -29,7 +29,7 @@ This allows:
 ### Algebra Selection
 
 ```python
-SpinNetConfig(
+WalshConfig(
     algebra="hadamard",      # or "octonion"
     head_mixing=True,        # Enable algebra-based head mixing
     hash_embeddings=False,   # Enable hash embeddings (experimental)
@@ -92,7 +92,7 @@ Hash collisions **prevent memorizing facts**, making the model naturally suited 
 
 ```
 ┌─────────────────┐     ┌─────────────────┐
-│  SpinNet Brain  │────▶│  Vector DB      │
+│  Walsh Brain  │────▶│  Vector DB      │
 │  (2M params)    │     │  (Knowledge)    │
 │  "How to think" │     │  "What to know" │
 └─────────────────┘     └─────────────────┘

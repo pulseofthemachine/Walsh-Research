@@ -1,5 +1,5 @@
 """
-SpinNet Training Script
+Walsh Training Script
 -----------------------
 Training loop for Octonion-Ternary Transformer models.
 """
@@ -11,12 +11,12 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 from torch._dynamo import disable
-from src.model import SpinNetConfig, SpinNet
+from src.model import WalshConfig, Walsh
 
 # -----------------------------------------------------------------------------
 # DEFAULT CONFIG (Overridden by config/train_fineweb.py)
 # -----------------------------------------------------------------------------
-out_dir = 'out-spinnet'
+out_dir = 'out-walsh'
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
@@ -160,8 +160,8 @@ if init_from == 'scratch':
                       bias=bias, vocab_size=None, dropout=dropout, 
                       head_mixing=head_mixing, algebra=algebra, hash_embeddings=hash_embeddings)
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = SpinNetConfig(**model_args)
-    model = SpinNet(gptconf)
+    gptconf = WalshConfig(**model_args)
+    model = Walsh(gptconf)
     
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
@@ -176,8 +176,8 @@ elif init_from == 'resume':
     if 'bias' not in checkpoint_model_args:
         checkpoint_model_args['bias'] = False
         
-    gptconf = SpinNetConfig(**checkpoint_model_args)
-    model = SpinNet(gptconf)
+    gptconf = WalshConfig(**checkpoint_model_args)
+    model = Walsh(gptconf)
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
@@ -196,7 +196,7 @@ model.to(device)
 # COMMAND CENTER: METRICS REPORT
 # -----------------------------------------------------------------------------
 print("-" * 60)
-print(">>> SPINNET: LAUNCH SEQUENCE <<<")
+print(">>> WALSH: LAUNCH SEQUENCE <<<")
 print("-" * 60)
 
 # Parameter Count
@@ -270,7 +270,7 @@ if init_from == 'resume' and 'optimizer' in checkpoint:
 checkpoint = None 
 
 if compile:
-    print("Compiling SpinNet (Default Mode)...")
+    print("Compiling Walsh (Default Mode)...")
     model = torch.compile(model, mode="default")
 
 # -----------------------------------------------------------------------------

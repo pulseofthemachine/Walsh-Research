@@ -1,5 +1,5 @@
 """
-TinyShakespeare Dataset Preparation for SpinNet
+TinyShakespeare Dataset Preparation for Walsh
 
 Downloads the TinyShakespeare dataset and prepares train/val splits.
 """

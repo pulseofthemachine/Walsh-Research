@@ -1,5 +1,5 @@
 """
-SpinNet Physics Layer
+Walsh Physics Layer
 ---------------------
 Ternary quantization and reference Octonion linear layer.
 
@@ -84,8 +84,8 @@ class OctonionTernaryLinearRef(nn.Module):
 # Select Implementation
 try:
     from .cayley_dickson_cuda import OctonionFusedLinear
-    # print("SpinNet: Using CUDA Fused Kernels") # Silence optimized print to avoid log spam
+    # print("Walsh: Using CUDA Fused Kernels") # Silence optimized print to avoid log spam
     OctonionTernaryLinear = OctonionFusedLinear
 except ImportError:
-    # print("SpinNet: Using Python Reference Implementation")
+    # print("Walsh: Using Python Reference Implementation")
     OctonionTernaryLinear = OctonionTernaryLinearRef

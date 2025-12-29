@@ -1,4 +1,4 @@
-//! SpinNet Inference Engine for Internet Computer (Single-User Mode)
+//! Walsh Inference Engine for Internet Computer (Single-User Mode)
 //!
 //! Implements layer-by-layer chunked execution with singleton state.
 
@@ -7,15 +7,16 @@
 
 mod model;
 mod octonion;
+mod hadamard;
 mod attention;
 mod tokenizer;
 
 use ic_cdk_macros::{init, post_upgrade, query, update};
 use std::cell::RefCell;
 
-use model::{SpinNetModel, KVCache};
+use model::{WalshModel, KVCache};
 
-const MODEL_BYTES: &[u8] = include_bytes!("../ckpt_v2.spinnet");
+const MODEL_BYTES: &[u8] = include_bytes!("../ckpt_v2.walsh");
 
 /// Generation state for chunked execution
 struct GenerationState {
@@ -47,7 +48,7 @@ enum ForwardPhase {
 }
 
 thread_local! {
-    static MODEL: RefCell<Option<SpinNetModel>> = RefCell::new(None);
+    static MODEL: RefCell<Option<WalshModel>> = RefCell::new(None);
     // Single-user state (Singleton)
     static GEN_STATE: RefCell<Option<GenerationState>> = RefCell::new(None);
     static FWD_STATE: RefCell<Option<ForwardState>> = RefCell::new(None);
@@ -64,13 +65,13 @@ fn post_upgrade() {
 }
 
 fn load_embedded_model() {
-    ic_cdk::println!("SpinNet: Loading model...");
-    match SpinNetModel::from_bytes(MODEL_BYTES) {
+    ic_cdk::println!("Walsh: Loading model...");
+    match WalshModel::from_bytes(MODEL_BYTES) {
         Ok(model) => {
             MODEL.with(|m| *m.borrow_mut() = Some(model));
-            ic_cdk::println!("SpinNet: Model loaded ({} bytes)", MODEL_BYTES.len());
+            ic_cdk::println!("Walsh: Model loaded ({} bytes)", MODEL_BYTES.len());
         }
-        Err(e) => ic_cdk::println!("SpinNet: Load failed: {}", e),
+        Err(e) => ic_cdk::println!("Walsh: Load failed: {}", e),
     }
 }
 

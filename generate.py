@@ -1,7 +1,7 @@
 """
-SpinNet Text Generation
+Walsh Text Generation
 -----------------------
-Generate text from any SpinNet checkpoint.
+Generate text from any Walsh checkpoint.
 
 Usage:
     python generate.py --ckpt experiments/out-tinystories-octonion/ckpt.pt --prompt "Once upon a time"
@@ -12,7 +12,7 @@ import argparse
 import time
 import torch
 import tiktoken
-from src.model import SpinNetConfig, SpinNet
+from src.model import WalshConfig, Walsh
 
 # Try to import CUDA optimizations (optional)
 try:
@@ -22,7 +22,7 @@ except ImportError:
     HAS_CUDA_OPT = False
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate text from SpinNet checkpoint')
+    parser = argparse.ArgumentParser(description='Generate text from Walsh checkpoint')
     parser.add_argument('--ckpt', type=str, required=True,
                         help='Path to checkpoint file (e.g., experiments/out-tinystories-octonion/ckpt.pt)')
     parser.add_argument('--prompt', type=str, default="Once upon a time",
@@ -50,13 +50,13 @@ def main():
 
     # Load checkpoint
     checkpoint = torch.load(args.ckpt, map_location=device, weights_only=False)
-    config = SpinNetConfig(**checkpoint['model_args'])
+    config = WalshConfig(**checkpoint['model_args'])
     
     print(f"Model: {config.n_layer} layers, {config.n_head} heads, {config.n_embd} dim")
     print(f"Vocab size: {config.vocab_size}")
     print(f"Algebra: {getattr(config, 'algebra', 'octonion')} | Head mixing: {getattr(config, 'head_mixing', False)} | Hash embeddings: {getattr(config, 'hash_embeddings', False)}")
     
-    model = SpinNet(config)
+    model = Walsh(config)
     
     # Load weights (handle compiled model prefix)
     state_dict = checkpoint['model']

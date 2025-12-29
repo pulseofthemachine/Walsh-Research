@@ -1,5 +1,5 @@
 """
-SpinNet Data Engineer: The Chinchilla Slice (Fixed)
+Walsh Data Engineer: The Chinchilla Slice (Fixed)
 -------------------------------------------
 Dataset: FineWeb-Edu (High Quality Reasoning)
 Target: 5 Billion Tokens (~10GB on disk)
@@ -94,4 +94,4 @@ print("-" * 50)
 print(f"Complete.")
 print(f"Total Tokens: {token_count/1e9:.2f} Billion")
 print(f"Train Path:   {TRAIN_BIN} ({os.path.getsize(TRAIN_BIN)/1e9:.2f} GB)")
-print("Ready for SpinNet.")
+print("Ready for Walsh.")

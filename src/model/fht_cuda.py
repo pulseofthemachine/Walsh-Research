@@ -1,5 +1,5 @@
 """
-SpinNet: Fast Hadamard Transform (FHT) CUDA Kernel
+Walsh: Fast Hadamard Transform (FHT) CUDA Kernel
 ---------------------------------------------------
 O(n log n) mixing layer for 32D Hadamard algebra.
 

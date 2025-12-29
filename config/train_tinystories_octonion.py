@@ -1,4 +1,4 @@
-# SpinNet TinyStories Config with Octonion Attention
+# Walsh TinyStories Config with Octonion Attention
 # Token-level (GPT-2 tokenizer) training for better semantic evaluation
 
 out_dir = 'experiments/out-tinystories-octonion'

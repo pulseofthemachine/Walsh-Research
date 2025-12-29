@@ -1,4 +1,4 @@
-# SpinNet TinyStories Config with Hadamard 32D Algebra
+# Walsh TinyStories Config with Hadamard 32D Algebra
 # Extreme compression (1/32nd parameters) using FHT mixing
 
 out_dir = 'experiments/out-tinystories-hadamard'

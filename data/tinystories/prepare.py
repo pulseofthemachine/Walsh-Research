@@ -1,5 +1,5 @@
 """
-TinyStories Dataset Preparation for SpinNet
+TinyStories Dataset Preparation for Walsh
 
 Downloads the TinyStories dataset from HuggingFace and tokenizes using GPT-2 tokenizer.
 This gives us token-level (subword) training instead of character-level.
