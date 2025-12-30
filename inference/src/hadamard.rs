@@ -1,7 +1,8 @@
-/// In-place Fast Hadamard Transform for 32 elements.
-/// Unrolled for maximum performance.
+/// In-place Fast Hadamard Transform for 32 elements (unnormalized).
+/// Skips the 1/sqrt(32) normalization for use in hadamard_linear.
+/// The normalization is deferred to be applied once via beta scaling.
 #[inline(always)]
-pub fn fht_32(x: &mut [f32; 32]) {
+pub fn fht_32_unnorm(x: &mut [f32; 32]) {
     // Stage 1 (Stride 1)
     for i in (0..32).step_by(2) {
         let a = x[i];
@@ -43,13 +44,21 @@ pub fn fht_32(x: &mut [f32; 32]) {
         x[j] = a + b;
         x[j+16] = a - b;
     }
-    
+    // No normalization - caller handles it
+}
+
+/// In-place Fast Hadamard Transform for 32 elements (normalized).
+/// Includes 1/sqrt(32) normalization.
+#[inline(always)]
+pub fn fht_32(x: &mut [f32; 32]) {
+    fht_32_unnorm(x);
     // Normalize by 1/sqrt(32)
     let norm = 0.1767766952966369; // 1/sqrt(32)
     for v in x.iter_mut() {
         *v *= norm;
     }
 }
+
 
 
 use std::cell::RefCell;
@@ -109,7 +118,7 @@ pub fn hadamard_linear(
             for g in 0..32 {
                 group[g] = x_scaled[g * in_per_part + i];
             }
-            fht_32(&mut group);
+            fht_32_unnorm(&mut group);
             for g in 0..32 {
                 x_mixed[g * in_per_part + i] = group[g];
             }
@@ -187,20 +196,21 @@ pub fn hadamard_linear(
             for g in 0..32 {
                 group[g] = y_result[g * out_per_part + o];
             }
-            fht_32(&mut group);
+            fht_32_unnorm(&mut group);
             for g in 0..32 {
                 y_mixed[g * out_per_part + o] = group[g];
             }
         }
         
-        // Step 4: Beta scaling
+        // Step 4: Beta scaling + deferred FHT normalization (1/32 = 1/sqrt(32)^2)
+        const FHT_NORM_SQ: f32 = 0.03125; // 1/32 = (1/sqrt(32))^2
         let broadcast_beta = beta.len() == out_per_part;
         for g in 0..32 {
             let base = g * out_per_part;
             for o in 0..out_per_part {
                 let idx = base + o;
                 let b = if broadcast_beta { beta[o] } else { beta.get(idx).copied().unwrap_or(1.0) };
-                y_mixed[idx] *= b;
+                y_mixed[idx] *= b * FHT_NORM_SQ;
             }
         }
         

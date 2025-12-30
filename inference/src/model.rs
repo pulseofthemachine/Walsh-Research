@@ -721,16 +721,17 @@ impl WalshModel {
         for t in 0..seq_len {
             let base = t * n_embd;
             
-            // Gather all head outputs for this position: [32, head_dim]
-            // Use Vec for dynamic head_dim (TinyStories uses head_dim=32, not 8)
-            let mut x_heads: Vec<Vec<f32>> = (0..32).map(|h| {
-                (0..head_dim).map(|d| {
-                    attn_out.get(base + h * head_dim + d).copied().unwrap_or(0.0)
-                }).collect()
-            }).collect();
+            // Gather all head outputs for this position: [32, 32]
+            // Use fixed arrays instead of Vec to avoid heap allocation
+            let mut x_heads: [[f32; 32]; 32] = [[0.0; 32]; 32];
+            for h in 0..32 {
+                for d in 0..head_dim.min(32) {
+                    x_heads[h][d] = attn_out[base + h * head_dim + d];
+                }
+            }
             
             // Step 1: FHT on head dimension for each feature
-            for d in 0..head_dim {
+            for d in 0..head_dim.min(32) {
                 let mut group: [f32; 32] = [0.0; 32];
                 for h in 0..32 {
                     group[h] = x_heads[h][d];
@@ -743,16 +744,12 @@ impl WalshModel {
             
             // Step 2: Per-head linear transform
             // y[h] = x[h] @ W[h].T means y[h, d_out] = sum_d_in(x[h, d_in] * W[h, d_in, d_out])
-            let mut y_heads: Vec<Vec<f32>> = vec![vec![0.0f32; head_dim]; 32];
+            let mut y_heads: [[f32; 32]; 32] = [[0.0; 32]; 32];
             for h in 0..32.min(w.len()) {
-                for d_out in 0..head_dim {
+                for d_out in 0..head_dim.min(32) {
                     let mut dot = 0.0f32;
-                    for d_in in 0..head_dim {
-                        let w_val = w.get(h)
-                            .and_then(|m| m.get(d_in))
-                            .and_then(|row| row.get(d_out))
-                            .copied()
-                            .unwrap_or(0.0);
+                    for d_in in 0..head_dim.min(32) {
+                        let w_val = w[h][d_in][d_out];
                         dot += x_heads[h][d_in] * w_val;
                     }
                     y_heads[h][d_out] = dot;
@@ -760,7 +757,7 @@ impl WalshModel {
             }
             
             // Step 3: FHT on head dimension for output
-            for d in 0..head_dim {
+            for d in 0..head_dim.min(32) {
                 let mut group: [f32; 32] = [0.0; 32];
                 for h in 0..32 {
                     group[h] = y_heads[h][d];
@@ -773,12 +770,13 @@ impl WalshModel {
             
             // Step 4: Apply beta scaling and write output
             for h in 0..32 {
-                for d in 0..head_dim {
-                    let b = beta.get(d).copied().unwrap_or(1.0);
+                for d in 0..head_dim.min(32) {
+                    let b = beta[d];
                     y[base + h * head_dim + d] = y_heads[h][d] * b;
                 }
             }
         }
+
         
         y
     }

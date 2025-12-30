@@ -130,13 +130,15 @@ pub fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
         sum_sq += v * v;
     }
     let rms = (sum_sq / n as f32 + eps).sqrt();
+    let inv_rms = 1.0 / rms;  // Compute inverse once
     
-    // Normalize and scale
+    // Normalize and scale - use multiply instead of divide
     x.iter()
         .zip(weight.iter())
-        .map(|(&xi, &wi)| xi / rms * wi)
+        .map(|(&xi, &wi)| xi * inv_rms * wi)
         .collect()
 }
+
 
 /// SiLU activation (Swish)
 pub fn silu(x: f32) -> f32 {
