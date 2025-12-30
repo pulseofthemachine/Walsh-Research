@@ -25,12 +25,16 @@ pub struct WalshModel {
     embeddings: Vec<f32>,              // [vocab_size, n_embd]
     // Hash embeddings (for hadamard + hash_embeddings=true)
     hash_embedding: Option<HashEmbedding>,
+    // Pre-computed output embeddings for fast vocab projection
+    // [vocab_size * n_embd] dense matrix, computed lazily on first generation
+    precomputed_output_embeddings: Option<Vec<f32>>,
     layers: Vec<TransformerLayer>,
     final_norm: Vec<f32>,              // RMSNorm weights
     rope_cos: Vec<f32>,                // [block_size, head_dim/2]
     rope_sin: Vec<f32>,
-    tokenizer: Tokenizer,              // Auto-detecting tokenizer
+    pub tokenizer: Tokenizer,              // Auto-detecting tokenizer
 }
+
 
 #[derive(Clone)]
 pub struct ModelConfig {
@@ -442,12 +446,14 @@ impl WalshModel {
             config,
             embeddings,
             hash_embedding,
+            precomputed_output_embeddings: None,
             layers,
             final_norm,
             rope_cos,
             rope_sin,
             tokenizer,
         })
+
     }
     
     /// Tokenize a string to token IDs
@@ -715,42 +721,16 @@ impl WalshModel {
         for t in 0..seq_len {
             let base = t * n_embd;
             
-            // For each output dimension across all heads
-            for d_out in 0..head_dim {
-                // Gather input values across 32 heads for this dimension
-                let mut x_group: [f32; 32] = [0.0; 32];
-                for h in 0..32 {
-                    x_group[h] = attn_out.get(base + h * head_dim + d_out).copied().unwrap_or(0.0);
-                }
-                
-                // Step 1: FHT on the 32-head dimension
-                fht_32(&mut x_group);
-                
-                // Step 2: Per-head linear transform: y_h = sum_d_in(x_fht[h] * W[h, d_in, d_out])
-                // Actually for head mixer, W is [32, head_dim, head_dim]
-                // The operation is: for each head h, y[h, d_out] = sum_d_in(x_fht[h, d_in] * W[h, d_in, d_out])
-                // But we're iterating by d_out, so we need to accumulate across d_in
-                
-                // For head mixing, each head has its own W matrix
-                // y[h] = x[h] @ W[h].T means y[h, d_out] = sum_d_in(x[h, d_in] * W[h, d_in, d_out])
-                
-                // Here we're computing for a single d_out across all heads
-                // Need to restructure: compute full output for this position
-            }
-            
-            // Actually, let's restructure to process properly
-            // For each head, we need to do: y[h] = x_fht[h] @ W[h].T
-            
             // Gather all head outputs for this position: [32, head_dim]
-            let mut x_heads: [[f32; 8]; 32] = [[0.0; 8]; 32];  // Assuming head_dim=8
-            for h in 0..32 {
-                for d in 0..head_dim.min(8) {
-                    x_heads[h][d] = attn_out.get(base + h * head_dim + d).copied().unwrap_or(0.0);
-                }
-            }
+            // Use Vec for dynamic head_dim (TinyStories uses head_dim=32, not 8)
+            let mut x_heads: Vec<Vec<f32>> = (0..32).map(|h| {
+                (0..head_dim).map(|d| {
+                    attn_out.get(base + h * head_dim + d).copied().unwrap_or(0.0)
+                }).collect()
+            }).collect();
             
             // Step 1: FHT on head dimension for each feature
-            for d in 0..head_dim.min(8) {
+            for d in 0..head_dim {
                 let mut group: [f32; 32] = [0.0; 32];
                 for h in 0..32 {
                     group[h] = x_heads[h][d];
@@ -762,12 +742,12 @@ impl WalshModel {
             }
             
             // Step 2: Per-head linear transform
-            let mut y_heads: [[f32; 8]; 32] = [[0.0; 8]; 32];
+            // y[h] = x[h] @ W[h].T means y[h, d_out] = sum_d_in(x[h, d_in] * W[h, d_in, d_out])
+            let mut y_heads: Vec<Vec<f32>> = vec![vec![0.0f32; head_dim]; 32];
             for h in 0..32.min(w.len()) {
-                // y[h] = x[h] @ W[h].T
-                for d_out in 0..head_dim.min(8) {
+                for d_out in 0..head_dim {
                     let mut dot = 0.0f32;
-                    for d_in in 0..head_dim.min(8) {
+                    for d_in in 0..head_dim {
                         let w_val = w.get(h)
                             .and_then(|m| m.get(d_in))
                             .and_then(|row| row.get(d_out))
@@ -780,7 +760,7 @@ impl WalshModel {
             }
             
             // Step 3: FHT on head dimension for output
-            for d in 0..head_dim.min(8) {
+            for d in 0..head_dim {
                 let mut group: [f32; 32] = [0.0; 32];
                 for h in 0..32 {
                     group[h] = y_heads[h][d];
@@ -793,7 +773,7 @@ impl WalshModel {
             
             // Step 4: Apply beta scaling and write output
             for h in 0..32 {
-                for d in 0..head_dim.min(8) {
+                for d in 0..head_dim {
                     let b = beta.get(d).copied().unwrap_or(1.0);
                     y[base + h * head_dim + d] = y_heads[h][d] * b;
                 }
@@ -802,6 +782,7 @@ impl WalshModel {
         
         y
     }
+
 
     /// Final normalization and sample next token (last step of chunked forward)
     pub fn final_norm_and_sample(&self, hidden: &[f32], seq_len: usize) -> usize {
@@ -821,8 +802,18 @@ impl WalshModel {
         // Output projection
         let mut logits = vec![0.0f32; self.config.vocab_size];
         
-        if let Some(ref hash_emb) = self.hash_embedding {
-            // Hash embedding output projection: dot product with reconstructed embeddings
+        // Use precomputed embeddings if available (fastest path)
+        if let Some(ref precomputed) = self.precomputed_output_embeddings {
+            for v in 0..self.config.vocab_size {
+                let mut dot = 0.0f32;
+                let base = v * n_embd;
+                for i in 0..n_embd {
+                    dot += normed[i] * precomputed[base + i];
+                }
+                logits[v] = dot;
+            }
+        } else if let Some(ref hash_emb) = self.hash_embedding {
+            // Hash embedding output projection (slow path - should be avoided)
             for v in 0..self.config.vocab_size {
                 let emb = self.hash_embed_single(hash_emb, v);
                 let mut dot = 0.0f32;
@@ -842,8 +833,32 @@ impl WalshModel {
             }
         }
         
-        sample_with_temperature(&logits, 0.8)
+        sample_with_temperature(&logits, 0.9)
     }
+    
+    /// Pre-compute output embeddings from hash tables for fast vocab projection
+    /// Should be called once before generation starts
+    pub fn precompute_output_embeddings(&mut self) {
+        if self.precomputed_output_embeddings.is_some() {
+            return; // Already computed
+        }
+        
+        if let Some(ref hash_emb) = self.hash_embedding {
+            let n_embd = self.config.n_embd;
+            let vocab_size = self.config.vocab_size;
+            let mut embeddings = vec![0.0f32; vocab_size * n_embd];
+            
+            for tok in 0..vocab_size {
+                let emb = self.hash_embed_single(hash_emb, tok);
+                for i in 0..n_embd {
+                    embeddings[tok * n_embd + i] = emb[i];
+                }
+            }
+            
+            self.precomputed_output_embeddings = Some(embeddings);
+        }
+    }
+
     
     pub fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String, String> {
         let mut tokens: Vec<usize> = self.tokenize(prompt);
@@ -854,7 +869,7 @@ impl WalshModel {
             }
             
             let logits = self.forward(&tokens);
-            let next_token = sample_with_temperature(&logits, 0.8);
+            let next_token = sample_with_temperature(&logits, 0.9);
             tokens.push(next_token);
         }
         

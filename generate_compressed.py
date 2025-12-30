@@ -335,6 +335,15 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str, default="ROMEO:", help="Prompt")
     parser.add_argument("--max_tokens", type=int, default=50, help="Tokens to generate")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
+    parser.add_argument("--temperature", type=float, default=0.9, help="Sampling temperature (0 for greedy)")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     
     args = parser.parse_args()
-    sample_from_walsh(args.walsh, args.prompt, args.max_tokens, device=args.device)
+    
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        if args.device == 'cuda':
+            torch.cuda.manual_seed_all(args.seed)
+    
+    sample_from_walsh(args.walsh, args.prompt, args.max_tokens, 
+                     device=args.device, temperature=args.temperature)

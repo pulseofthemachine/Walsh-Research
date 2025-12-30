@@ -61,10 +61,11 @@ while [ $GENERATED -lt $N ]; do
     fi
     
     TOTAL_OUTPUT+="$CHUNK"
-    # For character-level model: 1 char = 1 token
-    TOKEN_ESTIMATE=$CHUNK_LEN
+    # For GPT-2 model: ~4 chars = 1 token
+    TOKEN_ESTIMATE=$((CHUNK_LEN / 4))
+    [ $TOKEN_ESTIMATE -eq 0 ] && TOKEN_ESTIMATE=1
     GENERATED=$((GENERATED + TOKEN_ESTIMATE))
-    echo "  Generated $TOKEN_ESTIMATE tokens (total: $GENERATED/$N)"
+    echo "  Generated ~$TOKEN_ESTIMATE tokens (total: ~$GENERATED/$N)"
 done
 
 BURST_END=$(date +%s.%N)

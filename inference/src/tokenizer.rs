@@ -143,6 +143,16 @@ impl Tokenizer {
             }
         }
     }
+
+    /// Return debug info about tokenizer state
+    pub fn debug_info(&self) -> String {
+        match self {
+            Tokenizer::CharLevel { .. } => "CharLevel".to_string(),
+            Tokenizer::Gpt2 { decoder, encoder } => {
+                format!("Gpt2(decoder_len={}, encoder_len={})", decoder.len(), encoder.len())
+            }
+        }
+    }
 }
 
 /// Simple base64 decoder (avoid external dependency)

@@ -89,9 +89,12 @@ fn generate_full(prompt: String, max_tokens: u32) -> String {
 #[update]
 fn start_generation(prompt: String, max_tokens: u32) -> String {
     MODEL.with(|m| {
-        let model_ref = m.borrow();
-        match model_ref.as_ref() {
+        let mut model_ref = m.borrow_mut();
+        match model_ref.as_mut() {
             Some(model) => {
+                // Precompute output embeddings on first generation (lazy init)
+                model.precompute_output_embeddings();
+                
                 let tokens = model.tokenize(&prompt);
                 
                 // Clear any existing forward state
@@ -101,17 +104,20 @@ fn start_generation(prompt: String, max_tokens: u32) -> String {
                 
                 GEN_STATE.with(|s| {
                     *s.borrow_mut() = Some(GenerationState {
-                        tokens,
+                        tokens: tokens.clone(),
                         max_tokens: max_tokens as usize,
                         generated_count: 0,
                     });
                 });
-                format!("Started: {} prompt tokens, {} to generate", prompt.len(), max_tokens)
+                
+                format!("Started: {} prompt tokens, {} to generate. Debug: ConfigVocab={}, {}", 
+                    tokens.len(), max_tokens, model.config.vocab_size, model.tokenizer.debug_info())
             }
             None => "Error: No model".to_string(),
         }
     })
 }
+
 
 
 /// Start forward pass for current tokens (call before process_layer)
@@ -185,7 +191,7 @@ fn start_forward() -> String {
 fn process_layers(count: u32) -> String {
     // Adaptive chunking: monitor instruction usage
     const MAX_INSTRUCTIONS: u64 = 40_000_000_000;  // ICP limit
-    const SAFE_THRESHOLD: u64 = MAX_INSTRUCTIONS * 60 / 100;  // 60% = conservative for prompt processing
+    const SAFE_THRESHOLD: u64 = MAX_INSTRUCTIONS * 90 / 100;  // 90% = conservative for prompt processing
     let start_counter = ic_cdk::api::performance_counter(0);
     
     let result = MODEL.with(|m| {
