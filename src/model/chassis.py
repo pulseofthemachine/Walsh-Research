@@ -542,7 +542,7 @@ class Walsh(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, kv_cache: Optional[KVCache] = None, start_pos: int = 0):
+    def forward(self, idx, targets=None, kv_cache: Optional[KVCache] = None, start_pos: int = 0, return_hidden: bool = False):
         B, T = idx.shape
         h = self.tok_embeddings(idx)
         
@@ -575,6 +575,8 @@ class Walsh(nn.Module):
                 logits = self.tok_embeddings.output_projection(h[:, [-1], :])
             loss = None
         
+        if return_hidden:
+            return logits, loss, h
         return logits, loss
 
     @torch.no_grad()
