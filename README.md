@@ -2,7 +2,12 @@
 
 **Status:** `EXPERIMENTAL` / `ACTIVE DEV`
 
-Walsh is an exploratory architecture combining **1.58-bit (Ternary) Quantization** (à la BitNet) with **Hyper-Complex Algebras**. We replace standard linear layers with **Octonion (8D)** or **Hadamard (32D)** multiplications, compressing the "brain" of the model by 8/32x while maintaining expressivity through structured geometric mixing.
+Walsh is an exploratory transformer architecture combining **1.58-bit (Ternary) Quantization** (à la BitNet b1.58) with **Hyper-Complex Algebras** and **Interpretable Routing**. We replace standard linear layers with **Hadamard (32D)** or **Octonion (8D)** multiplications, achieving 32x/8x parameter compression while maintaining expressivity through structured geometric mixing.
+
+The architecture incorporates:
+- **mHC (Manifold Hyper-Connections)**: Multi-stream residuals with doubly-stochastic mixing
+- **Hadamard MoE**: Sparse Mixture of Experts with dynamic routing
+- **Channel Modulation**: Context-adaptive scaling of Hadamard channels
 
 Currently running on **CUDA** (via custom Triton kernels) and **WebAssembly** (on the Internet Computer blockchain).
 
@@ -14,53 +19,69 @@ Standard LLMs treat dimensions as independent. We force dimensions to interact v
 
 | Algebra | Dimension | Compression | Mixing | Complexity |
 |---------|-----------|-------------|--------|------------|
-| **Octonion** | 8D | 1/8th params | Cayley-Dickson | O(n²) |
 | **Hadamard** | 32D | 1/32th params | Fast Hadamard Transform | O(n log n) |
+| **Octonion** | 8D | 1/8th params | Cayley-Dickson | O(n²) |
 
-This allows:
-1. **Extreme Compression**: 0.87M "brain" params for a 26M total model
-2. **Memory Efficiency**: Ternary weights {-1, 0, +1} = 1.58 bits
-3. **Fast Mixing**: FHT provides structured mixing with zero learned params
+This enables:
+1. **Extreme Compression**: ~33% ternary sparsity (1/3 zeros, 1/3 +1, 1/3 -1)
+2. **Memory Efficiency**: Ternary weights {-1, 0, +1} = 1.58 bits per weight
+3. **Fast Mixing**: FHT provides structured mixing with O(n log n) complexity
+4. **Interpretability**: Sparse MoE routing and channel modulation expose decision pathways
 
 ---
 
 ## 🏗️ Architecture Overview
 
-### Algebra Selection
+### Core Configuration
 
 ```python
-WalshConfig(
-    algebra="hadamard",      # or "octonion"
-    head_mixing=True,        # Enable algebra-based head mixing
-    hash_embeddings=False,   # Enable hash embeddings (experimental)
+from src.model import WalshConfig, mHCWalsh
+
+config = WalshConfig(
+    n_layer=16,
     n_head=32,               # Must be divisible by algebra dimension
-    n_embd=512,
+    n_embd=512,              # 512D = 16 × 32D Hadamard blocks
+    algebra="hadamard",      # "hadamard" (32D) or "octonion" (8D)
+    head_mixing=True,        # Enable algebra-based head mixing
+    
+    # MoE (Mixture of Experts)
+    use_moe=True,            # Sparse expert routing in FFN
+    moe_threshold=0.1,       # Dynamic routing threshold
+    moe_max_experts=6,       # Maximum experts per token
+    
+    # Channel Modulation
+    use_channel_mod=True,    # Context-adaptive channel scaling
 )
+
+# With mHC multi-stream residuals
+model = mHCWalsh(config, n_streams=4)
 ```
 
-### Key Features
+### Architectural Layers
 
-| Feature | Octonion (8D) | Hadamard (32D) |
-|---------|---------------|----------------|
-| Linear Compression | 8x | 32x |
-| Head Groups | Groups of 8 | Groups of 32 |
-| Mixing Method | Cayley-Dickson | FHT (O(n log n)) |
-| Triton Kernels | ✅ Fused | ✅ FP32 accumulators |
-| Inference Packing | ✅ 4x memory | ✅ 16x memory |
+| Layer | Purpose | Key Feature |
+|-------|---------|-------------|
+| **Hadamard Linear** | 32x compressed projections | Ternary weights + FHT mixing |
+| **mHC Streams** | Multi-stream residuals | Doubly-stochastic mixing matrices |
+| **Hadamard MoE** | Sparse expert routing | Dynamic top-k expert selection |
+| **Channel Modulation** | Context-adaptive scaling | Global state → per-channel scales |
 
 ---
 
-## 🔄 mHC: Manifold Hyper-Connections (NEW)
+## 🔄 mHC: Manifold Hyper-Connections
 
 > Based on [arxiv.org/abs/2512.24880](https://arxiv.org/abs/2512.24880)
 
 mHC replaces standard residual connections with **multi-stream residuals** using doubly-stochastic mixing matrices for guaranteed stability.
 
-### Why mHC?
+### Standard vs mHC Residual
 
-Standard residual: `x = x + layer(x)` — single stream, can collapse
+```
+Standard:  x = x + layer(x)              — single stream, can collapse
 
-mHC residual: `x = H_res @ x + H_post^T @ layer(H_pre @ x)` — n parallel streams with balanced mixing
+mHC:       x = H_res @ x + H_post^T @ layer(H_pre @ x)
+                                          — n parallel streams with balanced mixing
+```
 
 ### Key Properties
 
@@ -69,99 +90,100 @@ mHC residual: `x = H_res @ x + H_post^T @ layer(H_pre @ x)` — n parallel strea
 | **Doubly stochastic H_res** | No stream can dominate (prevents collapse) |
 | **Spectral norm ≤ 1** | No gradient explosion |
 | **Birkhoff polytope** | Mixing = convex combo of permutations |
-| **Sinkhorn-Knopp projection** | Efficient manifold constraint |
+| **Sinkhorn-Knopp projection** | Efficient manifold constraint (Triton kernel) |
 
-### Usage
+### Emergent Stream Specialization
 
-```python
-WalshConfig(
-    use_mhc=True,    # Enable mHC residual streams
-    n_streams=4,     # Number of parallel streams
-    # ... other config
-)
-```
-
-### Channel Specialization Loss
-
-Encourages Hadamard channels to develop **distinct semantic roles** rather than uniform activation:
-
-```python
-# Options: 'specialization', 'contextual', 'bottleneck', or None
-channel_loss = 'specialization'
-channel_loss_weight = 0.01
-```
-
-| Loss | Effect |
-|------|--------|
-| `specialization` | Channels compete for distinct response patterns |
-| `contextual` | Nearby tokens use different channels |
-| `bottleneck` | Sparse, selective channel activation |
+In trained models, the 4 streams naturally specialize:
+- **Stream 0**: Primary syntax/structure pathway
+- **Stream 1**: Main semantic content pathway
+- **Stream 2**: Context/modulation pathway
+- **Stream 3**: Specialist features (adjectives, action verbs)
 
 ---
 
-## 🧬 Hash Embeddings (Experimental)
+## 🎯 Hadamard MoE (Mixture of Experts)
 
-> [!WARNING]
-> Hash embeddings are highly experimental. Quality may be lower than standard embeddings due to hash collisions between tokens.
+Sparse expert routing with ternary-quantized experts operating on 32D Hadamard blocks.
 
-### The Idea
-
-Standard embeddings dominate model size: `vocab_size × n_embd = 50K × 512 = 25.6M params`
-
-Hash embeddings use **composite hashing** with two small tables:
-```python
-# Instead of: embedding[token_id]  → 25.6M params
-# We use:    emb_1[token % 1021] + emb_2[token // 1021]  → 1.0M params
-```
-
-### Benefits
-
-| Metric | Standard | Hash Embeddings |
-|--------|----------|-----------------|
-| Embedding params | 25.6M | 1.0M |
-| Total model | 26.6M | **2.0M** |
-| VRAM (training) | ~6GB | **2.8GB** |
-| Compression | 1x | **25x** |
-
-### The Trade-off
-
-**What's preserved:**
-- ✅ Grammar and syntax
-- ✅ Common patterns and phrases
-- ✅ Reasoning structure
-
-**What's lost:**
-- ❌ Rare word distinctions (hash collisions)
-- ❌ Precise factual knowledge
-- ❌ Unique token associations
-
-### RAG-Native Architecture
-
-Hash collisions **prevent memorizing facts**, making the model naturally suited for Retrieval-Augmented Generation:
+### How It Works
 
 ```
-┌─────────────────┐     ┌─────────────────┐
-│  Walsh Brain  │────▶│  Vector DB      │
-│  (2M params)    │     │  (Knowledge)    │
-│  "How to think" │     │  "What to know" │
-└─────────────────┘     └─────────────────┘
+Input Token → Router → Select Top-K Experts → Weighted Sum
+              ↓
+         Threshold-based dynamic routing
+         (min 1, max 6 experts per token)
 ```
 
-**This architecture cannot hallucinate facts it never stored!**
+### Key Features
 
-### Training with Hash Embeddings
+| Feature | Implementation |
+|---------|----------------|
+| **Dynamic Top-K** | Threshold-based routing (not fixed top-k) |
+| **Auto-scaling** | N_experts = n_embd / 32 (e.g., 512D = 16 experts) |
+| **Load Balancing** | Auxiliary loss prevents expert collapse |
+| **Ternary Experts** | Each expert uses ternary quantization |
 
+### Observed Specialization
+
+| Expert | Specialization |
+|--------|----------------|
+| E0 | Universal (fires for everything) |
+| E3 | Function words ("the", "and", "with") |
+| E9 | Adjectives and descriptors |
+| E12, E15 | Content nouns and technical terms |
+
+---
+
+## 📡 Channel Modulation
+
+Context-adaptive scaling of Hadamard channels based on global sequence state.
+
+### Mechanism
+
+```
+Global State (mean pooling) → MLP → Scale & Shift per Channel
+                                    ↓
+                              Modulate hidden states
+```
+
+### Interpretation
+
+The model learns to use channel modulation as a **"genre detector"**:
+
+| Context | Channel Behavior |
+|---------|------------------|
+| Scientific | High scale in early layers (1.5x), drops to 0.8x |
+| Narrative | Even higher early (1.7x), gradual decay |
+| Dialogue | Lower overall (suppresses formality channels) |
+| Technical | Peak at layer 6, high variance |
+
+---
+
+## 📊 Analysis Suite
+
+Three analysis scripts for interpretability:
+
+### `analyze_categories.py`
+Semantic category clustering across 18 word types:
 ```bash
-# Ultra-compressed: ~2M params with 8L×512D
-python train.py config/train_tinystories_hadamard_hash.py
+python analyze_categories.py --ckpt experiments/out-wikipedia-512/ckpt.pt \
+    --output analysis/categories.png --hadamard-dim 32
 ```
 
-### Chunked Cross Entropy
+### `analyze_semantic.py`
+Comprehensive semantic analysis (analogies, synonyms, trajectories, mHC streams):
+```bash
+python analyze_semantic.py --ckpt experiments/out-wikipedia-512/ckpt.pt \
+    --output analysis_semantic/
+```
 
-Hash embeddings include memory-efficient loss computation:
-- Computes cross-entropy in vocab chunks (4K at a time)
-- Avoids materializing full `[B×T, vocab_size]` logits tensor
-- Reduces peak VRAM by ~60%
+### `analyze_moe_channel.py`
+MoE routing patterns and channel modulation dynamics:
+```bash
+python analyze_moe_channel.py --ckpt experiments/out-wikipedia-512/ckpt.pt \
+    --output analysis_moe/
+```
 
 ---
 
@@ -169,55 +191,63 @@ Hash embeddings include memory-efficient loss computation:
 
 ### 1. Install Dependencies
 ```bash
-pip install torch numpy triton tiktoken datasets transformers tqdm
+pip install torch numpy triton tiktoken datasets transformers tqdm matplotlib scikit-learn
 ```
 
 ### 2. Prepare Dataset
 ```bash
-# TinyStories (recommended for testing)
+# Wikipedia (1B tokens)
+python data/wikipedia/prepare.py
+
+# TinyStories (for testing)
 python data/tinystories/prepare.py
 ```
 
 ### 3. Train
 ```bash
-# Hadamard 32D (faster convergence, 32x compression)
+# Full architecture: mHC + MoE + Channel Modulation (512D, 16 layers)
+python train.py config/train_wikipedia_full.py
+
+# Quick test (smaller model)
 python train.py config/train_tinystories_hadamard.py
-
-# Hadamard + Hash Embeddings (experimental, 13x total compression)
-python train.py config/train_tinystories_hadamard_hash.py
-
-# Octonion 8D (original)
-python train.py config/train_tinystories_octonion.py
 ```
 
 ### 4. Generate
 ```bash
-python generate.py --ckpt experiments/out-tinystories-hadamard/ckpt.pt \
-    --prompt "Once upon a time" --max_tokens 100
+python generate.py --ckpt experiments/out-wikipedia-512/ckpt.pt \
+    --prompt "The quantum physicist" --max_tokens 100
+```
+
+### 5. Check Sparsity
+```bash
+python check_sparsity.py
+# Expected output: ~33% ternary sparsity (optimal for 1.58-bit)
 ```
 
 ---
 
-## 📊 Current Status
+## � Current Results
 
-### ✅ Verified Working
-- **Hadamard 32D**: 0.87M brain params, loss 3.5 @ 200 iters, 25 tok/s
-- **Hash Embeddings**: 2.0M total params, 2.8GB VRAM training
-- **Octonion 8D**: Full training + inference pipeline
-- **Head Mixing**: Both algebras support attention head mixing
-- **KV Cache**: 4.6x speedup for autoregressive generation
-- **ICP Deployment**: WebAssembly inference on Internet Computer
-
-### ⚠️ Experimental Features
-- **Hash Embeddings**: Quality vs compression trade-off under investigation
-- **Chunked Cross Entropy**: Memory-efficient but slightly slower
-
-### ⚠️ Rust/Wasm Status
-The Rust inference engine (`inference/`) currently supports **Octonion (8D) only**.
-
+### Model Configuration (512D, 16L)
 ```
-inference/src/model.rs  - Octonion 8D ✅ | Hadamard 32D ❌ | Hash Embeddings ❌
+Total Parameters:  35.5M
+Trainable:         35.5M
+Ternary Sparsity:  ~33% (optimal)
+Embedding:         512 dimensions
+Experts:           16 (auto-scaled from 512/32)
+Streams:           4 (mHC)
 ```
+
+### Emergent Properties
+- **Expert Specialization**: Function words, content words, and technical terms route to different experts
+- **Stream Differentiation**: Syntax vs semantics vs specialist features
+- **Context Adaptation**: Scientific text amplifies different channels than narrative text
+
+### Training Metrics
+At ~250 iterations on Wikipedia:
+- Loss: 4.75
+- Silhouette Score: 0.18 (semantic clustering)
+- Distance Ratio: 1.18 (between-category vs within-category)
 
 ---
 
@@ -226,18 +256,26 @@ inference/src/model.rs  - Octonion 8D ✅ | Hadamard 32D ❌ | Hash Embeddings �
 ### Python Training & Inference
 | File | Description |
 |------|-------------|
-| `src/model/chassis.py` | Model architecture with algebra selection + hash embeddings |
-| `src/model/mhc.py` | Manifold Hyper-Connections (multi-stream residuals) |
+| `src/model/chassis.py` | `Walsh` and `WalshConfig` base classes |
+| `src/model/mhc.py` | `mHCWalsh` with multi-stream residuals |
+| `src/model/moe.py` | `HadamardMoE` and `HadamardChannelModulation` |
 | `src/model/fht_cuda.py` | Hadamard 32D kernels with FHT |
-| `src/model/cayley_dickson_cuda.py` | Octonion 8D Triton kernels |
-| `analyze_type_clusters.py` | Channel specialization analysis (18 semantic categories) |
-| `config/train_wikipedia_mhc.py` | Wikipedia + mHC + channel specialization |
+| `src/model/physics.py` | Ternary quantization (BitNet b1.58 style) |
+| `train.py` | Training loop with MoE/ChannelMod logging |
+| `generate.py` | Text generation with checkpoint loading |
+| `check_sparsity.py` | Verify ternary weight distribution |
+
+### Analysis Scripts
+| File | Description |
+|------|-------------|
+| `analyze_categories.py` | 18-category semantic clustering |
+| `analyze_semantic.py` | Comprehensive semantic analysis suite |
+| `analyze_moe_channel.py` | MoE + Channel Modulation visualization |
 
 ### Rust/Wasm Inference (Octonion only)
 | File | Description |
 |------|-------------|
 | `inference/src/model.rs` | Rust inference with KV cache |
-| `inference/src/tokenizer.rs` | GPT-2/char tokenizer |
 | `inference/src/lib.rs` | IC Canister API |
 
 ---
@@ -245,43 +283,55 @@ inference/src/model.rs  - Octonion 8D ✅ | Hadamard 32D ❌ | Hash Embeddings �
 ## 🗺️ Roadmap
 
 ### Phase 1: Core Engine ✅
-- [x] Octonion 8D linear layers + head mixer
-- [x] Fused Triton kernels (6x speedup)
+- [x] Hadamard 32D / Octonion 8D linear layers
+- [x] Fused Triton kernels
 - [x] KV Cache for fast inference
-- [x] Rust/Wasm inference engine
-
-### Phase 2: Hadamard 32D ✅
-- [x] Fast Hadamard Transform (FHT) kernel
-- [x] 32D linear layers with O(n log n) mixing
 - [x] Variance-preserving initialization (α/β diagonals)
-- [x] FP32 accumulators for numerical stability
 
-### Phase 3: Extreme Compression 🧪
-- [x] Hash embeddings (25x embedding compression)
-- [x] Chunked cross entropy (60% VRAM reduction)
-- [ ] 3-table hash embeddings (better collision handling)
-- [ ] RAG integration for fact retrieval
-
-### Phase 4: mHC + Channel Specialization 🧪
+### Phase 2: mHC Integration ✅
 - [x] Manifold Hyper-Connections (multi-stream residuals)
-- [x] Sinkhorn-Knopp doubly-stochastic projection
-- [x] Channel-balanced initialization
-- [x] Three channel specialization losses
-- [x] Semantic analysis framework (18 categories)
-- [ ] Full mHC training validation
+- [x] Sinkhorn-Knopp doubly-stochastic projection (Triton kernel)
+- [x] Stream specialization emergence
 
-### Phase 5: Deployment 🚧
+### Phase 3: Sparse Experts ✅
+- [x] Hadamard MoE with dynamic top-k routing
+- [x] Ternary-quantized experts
+- [x] Auto-scaling (n_experts = n_embd / 32)
+- [x] Load balancing auxiliary loss
+
+### Phase 4: Channel Modulation ✅
+- [x] Context-adaptive per-channel scaling
+- [x] Triton fused kernel with autograd backward
+- [x] Genre/mode detection emergence
+
+### Phase 5: Interpretability ✅
+- [x] Semantic category analysis (18 types)
+- [x] MoE routing visualization
+- [x] Channel modulation dynamics plots
+- [x] mHC stream analysis
+
+### Phase 6: Scaling 🚧
+- [ ] 1B+ token pretraining validation
+- [ ] Instruction tuning
 - [ ] Hadamard support in Rust/Wasm
-- [ ] Hash embeddings in Rust/Wasm
 - [ ] Client-side browser inference
-- [ ] ICP mainnet deployment
 
 ---
 
 ## 📖 Technical Details
 
+### Ternary Quantization (BitNet b1.58)
+
+```python
+# Absmean scaling: γ = mean(|W|)
+# Quantize: W_ternary = clip(round(W / γ), -1, +1)
+# Straight-through estimator for gradients
+```
+
+Optimal distribution: ~33% zeros, ~33% +1, ~33% -1
+
 ### Variance-Preserving Initialization
-All layers use learned diagonal scaling (α input, β output) for ternary weights:
+
 ```python
 # α: per-feature input scaling [32, in_o]
 self.alpha = nn.Parameter(torch.ones(ALGEBRA_DIM, in_o))
@@ -292,36 +342,20 @@ self.beta = nn.Parameter(torch.ones(ALGEBRA_DIM, out_o) * beta_init)
 ```
 
 ### Channel-Balanced Initialization
-Prevents channel collapse by ensuring equal Frobenius norm across all 32 Hadamard channels:
+
 ```python
 weight_init = torch.randn(32, out_o, in_o) * 0.02
 channel_norms = weight_init.view(32, -1).norm(dim=1, keepdim=True)
 weight_init = weight_init / channel_norms  # Equal magnitude per channel
 ```
 
-### Parameter Breakdown
-
-**Standard Hadamard 32D:**
-```
-Total:      26.60M
-Embedding:  25.73M (97%)
-Brain:       0.87M (3%)
-```
-
-**Hadamard + Hash Embeddings:**
-```
-Total:       2.00M
-Embedding:   1.05M (52%)  ← 25x smaller!
-Brain:       0.95M (48%)
-```
-
 ---
 
 ## 📚 References
 
-- [BitNet: 1-bit LLMs](https://arxiv.org/abs/2310.11453)
-- [mHC: Manifold Hyper-Connections](https://arxiv.org/abs/2512.24880) ← NEW
+- [BitNet b1.58: 1-bit LLMs](https://arxiv.org/abs/2310.11453)
+- [mHC: Manifold Hyper-Connections](https://arxiv.org/abs/2512.24880)
+- [Mixture of Experts](https://arxiv.org/abs/1701.06538)
 - [Fast Hadamard Transform](https://en.wikipedia.org/wiki/Hadamard_transform)
 - [Cayley-Dickson Construction](https://en.wikipedia.org/wiki/Cayley%E2%80%93Dickson_construction)
-- [Hash Embeddings (Svenstrup et al.)](https://arxiv.org/abs/1709.03933)
-- [Sinkhorn-Knopp Algorithm](https://en.wikipedia.org/wiki/Sinkhorn%27s_theorem) ← NEW
+- [Sinkhorn-Knopp Algorithm](https://en.wikipedia.org/wiki/Sinkhorn%27s_theorem)

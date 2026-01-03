@@ -38,9 +38,9 @@ gradient_checkpointing = True
 
 # Training
 learning_rate = 3e-3
-max_iters = 1000
+max_iters = 15000
 warmup_iters = 100
-lr_decay_iters = 1000
+lr_decay_iters = 15000
 min_lr = 3e-5
 
 # Two-stage weight decay schedule
@@ -48,9 +48,9 @@ two_stage_schedule = True
 stage1_wd_peak = 0.1
 stage2_wd = 0.0
 cooldown_start = 0.5
-cooldown_lr = 1e-4
+cooldown_lr = 3e-5
 
-# Batch size (reduced for larger model)
+# Batch size 
 batch_size = 8
 gradient_accumulation_steps = 16  # Same effective batch
 
