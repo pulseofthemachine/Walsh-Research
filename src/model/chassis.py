@@ -42,6 +42,13 @@ class WalshConfig:
     head_mixing: bool = False  # Enable algebra-based head mixing (auto-detects type)
     algebra: str = "octonion"  # "octonion" (8D) or "hadamard" (32D)
     hash_embeddings: bool = False  # Use composite hash embeddings (25x compression)
+    # MoE settings
+    use_moe: bool = False  # Use Hadamard Mixture of Experts in FFN
+    moe_threshold: float = 0.1  # Dynamic routing threshold
+    moe_min_experts: int = 1  # Minimum experts per token
+    moe_max_experts: int = 4  # Maximum experts per token
+    # Channel Modulation settings
+    use_channel_mod: bool = False  # Use Hadamard Channel Modulation (bulk self-interaction)
 
 
 def get_linear_layer(config: WalshConfig):
@@ -505,7 +512,18 @@ class LlamaBlock(nn.Module):
         self.attention_norm = RMSNorm(config.n_embd)
         self.attention = CausalSelfAttention(config)
         self.ffn_norm = RMSNorm(config.n_embd)
-        self.feed_forward = SwiGLUMLP(config)
+        
+        # Choose FFN type: MoE or dense
+        if getattr(config, 'use_moe', False):
+            from .moe import HadamardMoE
+            self.feed_forward = HadamardMoE(
+                config,
+                threshold=getattr(config, 'moe_threshold', 0.1),
+                min_experts=getattr(config, 'moe_min_experts', 1),
+                max_experts=getattr(config, 'moe_max_experts', 4),
+            )
+        else:
+            self.feed_forward = SwiGLUMLP(config)
 
     def forward(self, x, freqs_cis, kv_cache: Optional[KVCache] = None, layer_idx: int = 0):
         h = x + self.attention(self.attention_norm(x), freqs_cis, kv_cache=kv_cache, layer_idx=layer_idx)

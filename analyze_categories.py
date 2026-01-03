@@ -318,7 +318,8 @@ def load_model(ckpt_path, device='cuda'):
     
     # Use model_args for architecture config (it has correct vocab_size)
     valid_fields = ['n_layer', 'n_head', 'n_embd', 'block_size', 'vocab_size', 
-                    'bias', 'dropout', 'head_mixing', 'algebra', 'hash_embeddings']
+                    'bias', 'dropout', 'head_mixing', 'algebra', 'hash_embeddings',
+                    'use_moe', 'use_channel_mod']
     arch_config = {k: v for k, v in model_args.items() if k in valid_fields}
     
     # Set vocab size if not present

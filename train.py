@@ -45,6 +45,16 @@ hash_embeddings = False  # Use composite hash embeddings (25x compression)
 use_mhc = False  # Enable mHC residual streams
 n_streams = 4    # Number of parallel streams
 
+# MoE (Mixture of Experts) - sparse expert routing
+use_moe = False  # Enable Hadamard MoE in FFN
+moe_threshold = 0.1  # Dynamic routing threshold
+moe_min_experts = 1  # Minimum experts per token
+moe_max_experts = 4  # Maximum experts per token  
+moe_aux_loss_weight = 0.01  # Load balancing loss weight
+
+# Channel Modulation - bulk self-interaction
+use_channel_mod = False  # Enable Hadamard Channel Modulation
+
 # Channel specialization losses (for emergent type structure)
 # Options: 'specialization', 'contextual', 'bottleneck', or None
 channel_loss = None  # Which loss to use
@@ -169,17 +179,32 @@ if init_from == 'scratch':
     use_mhc = config.get('use_mhc', False)
     n_streams = config.get('n_streams', 4)
     
+    # MoE settings 
+    use_moe = config.get('use_moe', False)
+    moe_threshold = config.get('moe_threshold', 0.1)
+    moe_min_experts = config.get('moe_min_experts', 1)
+    moe_max_experts = config.get('moe_max_experts', 4)
+    
+    # Channel modulation settings
+    use_channel_mod = config.get('use_channel_mod', False)
+    
     model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                       bias=bias, vocab_size=None, dropout=dropout, 
-                      head_mixing=head_mixing, algebra=algebra, hash_embeddings=hash_embeddings)
+                      head_mixing=head_mixing, algebra=algebra, hash_embeddings=hash_embeddings,
+                      use_moe=use_moe, moe_threshold=moe_threshold, 
+                      moe_min_experts=moe_min_experts, moe_max_experts=moe_max_experts,
+                      use_channel_mod=use_channel_mod)
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = WalshConfig(**model_args)
+    
+    # Gradient checkpointing for memory efficiency
+    gradient_checkpointing = config.get('gradient_checkpointing', False)
     
     # Choose model class based on mHC setting
     if use_mhc:
         from src.model import mHCWalsh
-        model = mHCWalsh(gptconf, n_streams=n_streams)
-        print(f"Using mHCWalsh with {n_streams} streams")
+        model = mHCWalsh(gptconf, n_streams=n_streams, gradient_checkpointing=gradient_checkpointing)
+        print(f"Using mHCWalsh with {n_streams} streams" + (" + checkpointing" if gradient_checkpointing else ""))
     else:
         model = Walsh(gptconf)
     
@@ -563,6 +588,18 @@ while True:
                     loss = loss + channel_loss_weight * ch_loss
             else:
                 logits, loss = model(X, Y)
+            
+            # MoE auxiliary loss for load balancing
+            moe_aux_weight = config.get('moe_aux_loss_weight', 0.01)
+            if hasattr(model, 'get_aux_loss'):
+                aux_loss = model.get_aux_loss()
+                if aux_loss is not None and aux_loss != 0:
+                    loss = loss + moe_aux_weight * aux_loss
+            elif hasattr(model, 'module') and hasattr(model.module, 'get_aux_loss'):
+                # Handle DDP wrapped model
+                aux_loss = model.module.get_aux_loss()
+                if aux_loss is not None and aux_loss != 0:
+                    loss = loss + moe_aux_weight * aux_loss
                 
             loss = loss / gradient_accumulation_steps 
         X, Y = get_batch('train') 
@@ -597,8 +634,40 @@ while True:
         w_std = w_stats.std().item()
         
         # Format: Iter | Loss | Time | GradNorm | WeightStd | LR | WD
-        print(f"iter {iter_num:>5} | loss {lossf:.4f} | time {dt*1000:.0f}ms | "
-              f"grad_n {grad_norm:.4f} | w_std {w_std:.4f} | lr {lr:.2e} | wd {wd:.3f}")
+        log_msg = f"iter {iter_num:>5} | loss {lossf:.4f} | time {dt*1000:.0f}ms | grad_n {grad_norm:.4f} | w_std {w_std:.4f} | lr {lr:.2e} | wd {wd:.3f}"
+        
+        # Add MoE stats if available
+        use_moe = config.get('use_moe', False)
+        if use_moe:
+            # Get model reference (handle DDP and torch.compile)
+            model_ref = model
+            if hasattr(model_ref, 'module'):
+                model_ref = model_ref.module
+            if hasattr(model_ref, '_orig_mod'):
+                model_ref = model_ref._orig_mod
+            if hasattr(model_ref, 'get_moe_stats'):
+                moe_stats = model_ref.get_moe_stats()
+                if moe_stats:
+                    avg_exp = moe_stats.get('avg_experts', 0)
+                    balance = moe_stats.get('load_balance', 0)
+                    log_msg += f" | exp {avg_exp:.1f} | bal {balance:.2f}"
+        
+        # Add Channel Mod stats if available
+        use_channel_mod = config.get('use_channel_mod', False)
+        if use_channel_mod:
+            model_ref = model
+            if hasattr(model_ref, 'module'):
+                model_ref = model_ref.module
+            if hasattr(model_ref, '_orig_mod'):
+                model_ref = model_ref._orig_mod
+            if hasattr(model_ref, 'get_channel_mod_stats'):
+                cm_stats = model_ref.get_channel_mod_stats()
+                if cm_stats:
+                    scale_mean = cm_stats.get('scale_mean', 1.0)
+                    scale_std = cm_stats.get('scale_std', 0.0)
+                    log_msg += f" | scl {scale_mean:.2f}±{scale_std:.2f}"
+        
+        print(log_msg)
 
     iter_num += 1
     local_iter_num += 1

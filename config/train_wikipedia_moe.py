@@ -1,7 +1,7 @@
-# Wikipedia training with mHC + channel specialization
-# Tests multi-stream residuals and semantic channel differentiation
+# Wikipedia training with mHC + MoE + channel specialization
+# Tests multi-stream residuals with sparse expert routing
 
-out_dir = 'experiments/out-wikipedia-mhc'
+out_dir = 'experiments/out-wikipedia-moe'
 eval_interval = 250
 log_interval = 10
 eval_iters = 100
@@ -29,6 +29,14 @@ hash_embeddings = False
 use_mhc = True   # Enable doubly-stochastic residual streams
 n_streams = 4    # Number of parallel streams
 
+# MoE (Mixture of Experts) - Hadamard block experts
+# Each 32D block is an expert, dynamic routing
+use_moe = True   # Enable sparse expert FFN
+moe_threshold = 0.1  # Dynamic threshold for expert selection
+moe_min_experts = 1  # Minimum experts per token
+moe_max_experts = 4  # Maximum experts per token
+moe_aux_loss_weight = 0.01  # Load balancing auxiliary loss
+
 # Channel specialization loss - encourages semantic differentiation
 # Options: 'specialization', 'contextual', 'bottleneck', or None
 channel_loss = 'specialization'
@@ -36,7 +44,7 @@ channel_loss_weight = 0.01
 
 # AdamW
 learning_rate = 3e-3
-max_iters = 10000  # Quick run
+max_iters = 1000  # Short test run
 weight_decay = 0.1
 beta1 = 0.9
 beta2 = 0.95

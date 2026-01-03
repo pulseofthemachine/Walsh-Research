@@ -454,6 +454,12 @@ class mHCLlamaBlock(nn.Module):
     
     Uses the same attention/FFN as standard LlamaBlock but with
     manifold-constrained residual connections.
+    
+    Architecture per layer:
+    - Level 2: Attention (token ↔ token)
+    - Level 3: mHC streams (stream ↔ stream via doubly stochastic)
+    - Level 4: MoE routing (token → expert)
+    - Level 5: Channel modulation (bulk → channel, optional)
     """
     def __init__(self, config, n_streams=4):
         super().__init__()
@@ -469,7 +475,30 @@ class mHCLlamaBlock(nn.Module):
         
         # Core layers
         self.attention = CausalSelfAttention(config)
-        self.feed_forward = SwiGLUMLP(config)
+        
+        # FFN: MoE or dense
+        if getattr(config, 'use_moe', False):
+            from .moe import HadamardMoE
+            self.feed_forward = HadamardMoE(
+                config,
+                threshold=getattr(config, 'moe_threshold', 0.1),
+                min_experts=getattr(config, 'moe_min_experts', 1),
+                max_experts=getattr(config, 'moe_max_experts', 4),
+            )
+        else:
+            self.feed_forward = SwiGLUMLP(config)
+        
+        # Channel modulation (optional)
+        self.use_channel_mod = getattr(config, 'use_channel_mod', False)
+        if self.use_channel_mod:
+            from .moe import HadamardChannelModulation
+            self.channel_mod = HadamardChannelModulation(
+                n_embd=config.n_embd,
+                n_blocks=None,  # Auto-computed: n_embd // 32
+                use_ternary=True,
+                residual_scale=0.5,
+            )
+            self.channel_mod_norm = RMSNorm(config.n_embd)
         
         # mHC residual streams
         self.attn_stream = mHCResidualStream(config.n_embd, n_streams)
@@ -480,6 +509,8 @@ class mHCLlamaBlock(nn.Module):
         x: [B, T, n_streams, n_embd] - multi-stream residual
         Returns: [B, T, n_streams, n_embd]
         """
+        B, T, n, C = x.shape
+        
         # Attention with mHC streams
         def attn_fn(x_in):
             return self.attention(self.attention_norm(x_in), freqs_cis, 
@@ -492,6 +523,13 @@ class mHCLlamaBlock(nn.Module):
             return self.feed_forward(self.ffn_norm(x_in))
         
         x = self.ffn_stream(x, ffn_fn)
+        
+        # Channel modulation (bulk → channel)
+        if self.use_channel_mod:
+            # Apply channel modulation per stream
+            x_flat = x.view(B * n, T, C)  # Treat each stream independently
+            x_flat = x_flat + self.channel_mod(self.channel_mod_norm(x_flat))
+            x = x_flat.view(B, T, n, C)
         
         return x
 
@@ -508,10 +546,11 @@ class mHCWalsh(nn.Module):
     - Stable gradient flow across arbitrary depth
     - Enhanced model capacity via multi-stream architecture
     """
-    def __init__(self, config, n_streams=4):
+    def __init__(self, config, n_streams=4, gradient_checkpointing=False):
         super().__init__()
         self.config = config
         self.n_streams = n_streams
+        self.gradient_checkpointing = gradient_checkpointing
         
         # Import required modules
         from .chassis import RMSNorm, precompute_freqs_cis
@@ -603,9 +642,13 @@ class mHCWalsh(nn.Module):
         # Get RoPE frequencies
         freqs_cis = self.freqs_cis[start_pos:start_pos + T]
         
-        # Process through mHC blocks
+        # Process through mHC blocks (with optional gradient checkpointing)
         for layer_idx, layer in enumerate(self.layers):
-            h = layer(h, freqs_cis, kv_cache=kv_cache, layer_idx=layer_idx)
+            if self.gradient_checkpointing and self.training:
+                from torch.utils.checkpoint import checkpoint
+                h = checkpoint(layer, h, freqs_cis, kv_cache, layer_idx, use_reentrant=False)
+            else:
+                h = layer(h, freqs_cis, kv_cache=kv_cache, layer_idx=layer_idx)
         
         # Merge streams: [B, T, n_streams, n_embd] -> [B, T, n_embd]
         h_flat = h.reshape(B, T, self.n_streams * self.config.n_embd)
@@ -643,6 +686,69 @@ class mHCWalsh(nn.Module):
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return total, trainable
+    
+    def get_aux_loss(self):
+        """
+        Collect auxiliary losses from MoE layers (for load balancing).
+        Returns 0 if no MoE layers present.
+        """
+        aux_loss = 0.0
+        for layer in self.layers:
+            if hasattr(layer.feed_forward, 'get_aux_loss'):
+                aux_loss = aux_loss + layer.feed_forward.get_aux_loss()
+        return aux_loss
+    
+    def get_moe_stats(self) -> dict:
+        """
+        Collect MoE expert usage statistics from all layers.
+        Returns aggregated stats if MoE is enabled.
+        """
+        all_stats = []
+        for layer in self.layers:
+            if hasattr(layer.feed_forward, 'get_expert_stats'):
+                all_stats.append(layer.feed_forward.get_expert_stats())
+        
+        if not all_stats:
+            return {}
+        
+        # Aggregate across layers
+        n_experts = len(all_stats[0]['expert_load'])
+        avg_load = [0.0] * n_experts
+        for stats in all_stats:
+            for i, load in enumerate(stats['expert_load']):
+                avg_load[i] += load / len(all_stats)
+        
+        return {
+            'expert_load': avg_load,
+            'avg_experts': sum(s['avg_experts'] for s in all_stats) / len(all_stats),
+            'load_balance': sum(s['load_balance'] for s in all_stats) / len(all_stats),
+        }
+    
+    def reset_moe_stats(self):
+        """Reset MoE statistics for all layers."""
+        for layer in self.layers:
+            if hasattr(layer.feed_forward, 'reset_stats'):
+                layer.feed_forward.reset_stats()
+    
+    def get_channel_mod_stats(self) -> dict:
+        """
+        Collect channel modulation statistics from all layers.
+        Returns aggregated stats if channel modulation is enabled.
+        """
+        all_stats = []
+        for layer in self.layers:
+            if hasattr(layer, 'channel_mod') and hasattr(layer.channel_mod, 'get_modulation_stats'):
+                all_stats.append(layer.channel_mod.get_modulation_stats())
+        
+        if not all_stats:
+            return {}
+        
+        # Aggregate across layers
+        return {
+            'scale_mean': sum(s['scale_mean'] for s in all_stats) / len(all_stats),
+            'scale_std': sum(s['scale_std'] for s in all_stats) / len(all_stats),
+            'shift_mean': sum(s['shift_mean'] for s in all_stats) / len(all_stats),
+        }
     
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):

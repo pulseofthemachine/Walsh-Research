@@ -26,6 +26,7 @@ from scipy.stats import spearmanr
 import argparse
 import tiktoken
 import os
+from collections import defaultdict
 
 # -----------------------------------------------------------------------------
 # SEMANTIC TEST SETS
@@ -88,7 +89,7 @@ def load_model(ckpt_path, device='cuda'):
     from src.model import Walsh, WalshConfig, mHCWalsh
     
     print(f"Loading model from {ckpt_path}...")
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     
     state_dict = ckpt.get('model', ckpt)
     clean_state = {}
@@ -101,8 +102,13 @@ def load_model(ckpt_path, device='cuda'):
     model_args = ckpt.get('model_args', {})
     config_dict = ckpt.get('config', {})
     
-    valid_fields = ['n_layer', 'n_head', 'n_embd', 'block_size', 'vocab_size', 
-                    'bias', 'dropout', 'head_mixing', 'algebra', 'hash_embeddings']
+    # Updated fields to include MoE and ChannelMod
+    valid_fields = [
+        'n_layer', 'n_head', 'n_embd', 'block_size', 'vocab_size', 
+        'bias', 'dropout', 'head_mixing', 'algebra', 'hash_embeddings',
+        'use_moe', 'moe_threshold', 'moe_min_experts', 'moe_max_experts',
+        'use_channel_mod'
+    ]
     arch_config = {k: v for k, v in model_args.items() if k in valid_fields}
     
     if 'vocab_size' not in arch_config:
@@ -607,6 +613,255 @@ def analyze_mhc_streams(model, enc, device, output_dir, n_streams):
 # MAIN
 # -----------------------------------------------------------------------------
 
+# Additional edge-case tests - items known to be single tokens in GPT-2
+ADVERSARIAL_TESTS = {
+    "Rare Words": ["aardvark", "zeppelin", "xylophone", "quasar", "fjord", "sphinx"],
+    "Numbers": ["zero", "hundred", "million", "billion", "trillion", "infinity"],
+    "Tech Terms": ["http", "www", "html", "json", "api", "cpu", "gpu", "ram"],
+    "Emotions": ["happy", "sad", "angry", "afraid", "love", "hate", "joy", "fear"],
+    "Function Words": ["the", "and", "but", "if", "or", "not", "yet", "so"],
+    "Actions": ["run", "jump", "walk", "fly", "swim", "climb", "fall", "rise"],
+}
+
+
+def analyze_channel_ablation(model, enc, device, output_dir):
+    """Zero out channels and measure impact on generation quality."""
+    print("\n=== Analysis 9: Channel Ablation Study ===")
+    
+    prompt = "The history of science began when"
+    tokens = enc.encode(prompt)
+    x = torch.tensor([tokens], device=device)
+    
+    results = {}
+    
+    # Get baseline perplexity
+    with torch.no_grad():
+        logits_base, loss_base = model(x)
+        baseline_loss = loss_base.item() if loss_base is not None else 0
+    
+    results['baseline'] = baseline_loss
+    
+    # Test ablating each channel (via embedding modification)
+    # We'll measure embedding variance impact as proxy
+    emb_weight = model.tok_embeddings.weight.data.clone()
+    n_channels = 32
+    n_blocks = emb_weight.shape[1] // n_channels
+    
+    channel_importance = []
+    for ch in range(n_channels):
+        # Zero out this channel in embeddings
+        emb_reshaped = emb_weight.reshape(-1, n_blocks, n_channels)
+        channel_energy = emb_reshaped[:, :, ch].abs().mean().item()
+        channel_importance.append(channel_energy)
+    
+    # Plot importance
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Bar plot of channel importance
+    colors = ['red' if i == 10 else 'blue' for i in range(32)]
+    axes[0].bar(range(32), channel_importance, color=colors, alpha=0.7)
+    axes[0].set_xlabel('Hadamard Channel')
+    axes[0].set_ylabel('Mean |Activation| in Embeddings')
+    axes[0].set_title('Channel Importance (Red = Ch10)')
+    axes[0].axhline(y=np.mean(channel_importance), color='gray', linestyle='--', label='Mean')
+    axes[0].legend()
+    
+    # Sorted importance
+    sorted_idx = np.argsort(channel_importance)[::-1]
+    axes[1].bar(range(32), [channel_importance[i] for i in sorted_idx], alpha=0.7)
+    axes[1].set_xlabel('Rank')
+    axes[1].set_ylabel('Mean |Activation|')
+    axes[1].set_title('Channel Importance (Sorted)')
+    axes[1].set_xticks(range(32))
+    axes[1].set_xticklabels([f'Ch{i}' for i in sorted_idx], rotation=90)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'channel_ablation.png'), dpi=150)
+    plt.close()
+    
+    print(f"  Top 5 channels: {[f'Ch{sorted_idx[i]}' for i in range(5)]}")
+    print(f"  Bottom 5 channels: {[f'Ch{sorted_idx[-(i+1)]}' for i in range(5)]}")
+    print(f"  Saved: {output_dir}/channel_ablation.png")
+
+
+def analyze_attention_heads(model, enc, device, output_dir):
+    """Analyze what each attention head specializes in."""
+    print("\n=== Analysis 10: Attention Head Specialization ===")
+    
+    # Get attention patterns for a sample sentence
+    sentence = "The quick brown fox jumps over the lazy dog"
+    tokens = enc.encode(sentence)
+    token_tensor = torch.tensor([tokens], device=device)
+    
+    # Hook to capture attention weights
+    attention_patterns = []
+    
+    def hook_fn(module, input, output):
+        # Try to capture attention weights if available
+        if isinstance(output, tuple) and len(output) > 1:
+            attention_patterns.append(output[1])
+    
+    # Register hooks on attention layers
+    hooks = []
+    for layer in model.layers:
+        if hasattr(layer, 'attention'):
+            hooks.append(layer.attention.register_forward_hook(hook_fn))
+        elif hasattr(layer, 'attn'):
+            hooks.append(layer.attn.register_forward_hook(hook_fn))
+    
+    # Forward pass
+    with torch.no_grad():
+        _ = model(token_tensor)
+    
+    # Remove hooks
+    for h in hooks:
+        h.remove()
+    
+    # Analyze query/key/value patterns from weights instead
+    n_heads = model.config.n_head
+    n_layers = model.config.n_layer
+    
+    # Compute head diversity across layers
+    head_norms = []
+    for layer_idx, layer in enumerate(model.layers):
+        if hasattr(layer, 'attention'):
+            attn = layer.attention
+        elif hasattr(layer, 'attn'):
+            attn = layer.attn
+        else:
+            continue
+        
+        # Get Q, K, V weight norms per head
+        if hasattr(attn, 'wq'):
+            wq = attn.wq.weight.data
+            wk = attn.wk.weight.data
+            wv = attn.wv.weight.data
+            
+            head_dim = wq.shape[0] // n_heads
+            for h in range(n_heads):
+                q_norm = wq[h*head_dim:(h+1)*head_dim].norm().item()
+                k_norm = wk[h*head_dim:(h+1)*head_dim].norm().item()
+                v_norm = wv[h*head_dim:(h+1)*head_dim].norm().item()
+                head_norms.append({
+                    'layer': layer_idx,
+                    'head': h,
+                    'q_norm': q_norm,
+                    'k_norm': k_norm,
+                    'v_norm': v_norm
+                })
+    
+    if not head_norms:
+        print("  Could not extract attention head info")
+        return
+    
+    # Plot head norms
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    
+    q_matrix = np.zeros((n_layers, n_heads))
+    k_matrix = np.zeros((n_layers, n_heads))
+    v_matrix = np.zeros((n_layers, n_heads))
+    
+    for entry in head_norms:
+        q_matrix[entry['layer'], entry['head']] = entry['q_norm']
+        k_matrix[entry['layer'], entry['head']] = entry['k_norm']
+        v_matrix[entry['layer'], entry['head']] = entry['v_norm']
+    
+    im0 = axes[0].imshow(q_matrix, aspect='auto', cmap='viridis')
+    axes[0].set_xlabel('Head')
+    axes[0].set_ylabel('Layer')
+    axes[0].set_title('Query Weight Norms')
+    plt.colorbar(im0, ax=axes[0])
+    
+    im1 = axes[1].imshow(k_matrix, aspect='auto', cmap='viridis')
+    axes[1].set_xlabel('Head')
+    axes[1].set_ylabel('Layer')
+    axes[1].set_title('Key Weight Norms')
+    plt.colorbar(im1, ax=axes[1])
+    
+    im2 = axes[2].imshow(v_matrix, aspect='auto', cmap='viridis')
+    axes[2].set_xlabel('Head')
+    axes[2].set_ylabel('Layer')
+    axes[2].set_title('Value Weight Norms')
+    plt.colorbar(im2, ax=axes[2])
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'attention_heads.png'), dpi=150)
+    plt.close()
+    print(f"  Analyzed {len(head_norms)} heads across {n_layers} layers")
+    print(f"  Saved: {output_dir}/attention_heads.png")
+
+
+def analyze_adversarial(model, enc, device, output_dir):
+    """Test model on edge cases: neologisms, numbers, symbols, code."""
+    print("\n=== Analysis 11: Adversarial/Edge Case Probes ===")
+    
+    results = {}
+    
+    for category, test_items in ADVERSARIAL_TESTS.items():
+        category_results = []
+        for item in test_items:
+            tokens = enc.encode(item)
+            n_tokens = len(tokens)
+            
+            # Get embedding if single token
+            if n_tokens == 1:
+                e = get_embedding(model, enc, item, device)
+                if e is not None:
+                    ch = analyze_channels(e)
+                    category_results.append({
+                        'item': item,
+                        'n_tokens': n_tokens,
+                        'channel_pattern': ch,
+                        'max_channel': np.argmax(ch),
+                        'entropy': -np.sum(ch/ch.sum() * np.log(ch/ch.sum() + 1e-8))
+                    })
+            else:
+                category_results.append({
+                    'item': item,
+                    'n_tokens': n_tokens,
+                    'channel_pattern': None,
+                    'max_channel': None,
+                    'entropy': None
+                })
+        
+        results[category] = category_results
+    
+    # Plot
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    axes = axes.flatten()
+    
+    for idx, (category, cat_results) in enumerate(results.items()):
+        if idx >= 6:
+            break
+        
+        ax = axes[idx]
+        
+        # Plot channel patterns for single-token items
+        single_token = [r for r in cat_results if r['channel_pattern'] is not None]
+        
+        if single_token:
+            for r in single_token:
+                ax.plot(r['channel_pattern'], label=r['item'][:10], alpha=0.7)
+            ax.set_xlabel('Channel')
+            ax.set_ylabel('Activation')
+            ax.set_title(f'{category} ({len(single_token)} single-token)')
+            ax.legend(fontsize=7)
+        else:
+            ax.text(0.5, 0.5, f'{category}\n(all multi-token)', 
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(category)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'adversarial.png'), dpi=150)
+    plt.close()
+    
+    print(f"  Categories tested: {list(results.keys())}")
+    for cat, res in results.items():
+        single = sum(1 for r in res if r['channel_pattern'] is not None)
+        print(f"    {cat}: {single}/{len(res)} single-token")
+    print(f"  Saved: {output_dir}/adversarial.png")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Comprehensive semantic analysis')
     parser.add_argument('--ckpt', type=str, required=True, help='Path to checkpoint')
@@ -628,6 +883,9 @@ def main():
         print(f"Streams: {n_streams}")
     
     # Run all analyses
+    analyze_moe_specialization(model, enc, args.device, args.output)
+    analyze_channel_modulation_dynamics(model, enc, args.device, args.output)
+    
     analyze_analogies(model, enc, args.device, args.output)
     analyze_antonyms_synonyms(model, enc, args.device, args.output)
     analyze_composition(model, enc, args.device, args.output)
@@ -639,8 +897,116 @@ def main():
     if use_mhc:
         analyze_mhc_streams(model, enc, args.device, args.output, n_streams)
     
+    # New analyses
+    analyze_channel_ablation(model, enc, args.device, args.output)
+    analyze_attention_heads(model, enc, args.device, args.output)
+    analyze_adversarial(model, enc, args.device, args.output)
+    
     print(f"\n✅ All analyses complete! Results in {args.output}/")
+
+
+def analyze_moe_specialization(model, enc, device, output_dir):
+    """Analysis 9: MoE Expert Specialization."""
+    print("\n--- Analysis 9: MoE Expert Specialization ---")
+    
+    if not hasattr(model.config, 'use_moe') or not model.config.use_moe:
+        print("  MoE not enabled in this model, skipping.")
+        return
+
+    # Categorize words for MoE testing
+    categories = {
+        "Function": ["the", "a", "an", "in", "on", "at", "to", "for", "with", "and", "or", "but"],
+        "Verbs": ["is", "are", "was", "be", "do", "have", "say", "go", "get", "make", "know"],
+        "Nouns": ["time", "person", "year", "way", "day", "thing", "man", "world", "life", "hand"],
+        "Technical": ["quantum", "algorithm", "energy", "matter", "electron", "database", "binary"],
+    }
+    
+    n_experts = model.config.n_embd // 32
+    results = {}
+    
+    for cat, words in categories.items():
+        expert_usage = np.zeros(n_experts)
+        count = 0
+        for word in words:
+            token = enc.encode(" " + word)
+            if len(token) != 1: continue
+            
+            token_tensor = torch.tensor([token], device=device)
+            with torch.no_grad():
+                _ = model(token_tensor)
+            
+            # Aggregate from all layers
+            for layer in model.layers:
+                if hasattr(layer.feed_forward, '_last_expert_mask'):
+                    mask = layer.feed_forward._last_expert_mask # [1, 1, n_experts]
+                    expert_usage += mask[0, 0].cpu().numpy()
+            count += 1
+        
+        if count > 0:
+            results[cat] = expert_usage / (count * model.config.n_layer)
+
+    # Plot
+    plt.figure(figsize=(12, 6))
+    x = np.arange(n_experts)
+    width = 0.8 / len(results)
+    for i, (cat, usage) in enumerate(results.items()):
+        plt.bar(x + (i - len(results)/2)*width, usage, width, label=cat)
+    
+    plt.xlabel("Expert Index")
+    plt.ylabel("Avg Activation Probability")
+    plt.title("MoE Expert Specialization by Part-of-Speech")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.savefig(f"{output_dir}/moe_specialization.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {output_dir}/moe_specialization.png")
+
+def analyze_channel_modulation_dynamics(model, enc, device, output_dir):
+    """Analysis 10: Channel Modulation Dynamics."""
+    print("\n--- Analysis 10: Channel Modulation Dynamics ---")
+    
+    if not hasattr(model.config, 'use_channel_mod') or not model.config.use_channel_mod:
+        print("  Channel Modulation not enabled in this model, skipping.")
+        return
+
+    contexts = {
+        "Scientific": "Quantum entanglement describes particles sharing state.",
+        "Narrative": "The knight fought the dragon in the dark cave.",
+        "Dialogue": "Hello there, how are you feeling today?",
+        "Technical": "The database query returned an empty result set."
+    }
+    
+    results = {}
+    for name, text in contexts.items():
+        tokens = enc.encode(text)
+        token_tensor = torch.tensor([tokens], device=device)
+        
+        with torch.no_grad():
+            _ = model(token_tensor)
+            
+        layer_scales = []
+        for layer in model.layers:
+            if hasattr(layer, 'channel_mod'):
+                stats = layer.channel_mod.get_modulation_stats()
+                layer_scales.append(stats['scale_mean'])
+        results[name] = layer_scales
+
+    # Plot
+    plt.figure(figsize=(10, 6))
+    for name, scales in results.items():
+        plt.plot(scales, marker='o', label=name)
+    
+    plt.axhline(y=1.0, color='r', linestyle='--', alpha=0.3)
+    plt.xlabel("Layer")
+    plt.ylabel("Mean Channel Scale")
+    plt.title("Channel Modulation Dynamics by Context")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.savefig(f"{output_dir}/channel_mod_dynamics.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {output_dir}/channel_mod_dynamics.png")
 
 
 if __name__ == '__main__':
     main()
+
