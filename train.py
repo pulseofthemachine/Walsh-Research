@@ -545,23 +545,38 @@ while True:
     # 2. Evaluation & Checkpointing
     if iter_num % eval_interval == 0 and iter_num > 0:
         losses = estimate_loss()
-        print(f"\n[EVAL] step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        if always_save_checkpoint:
-            if iter_num > 0:
-                checkpoint = {
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'config': config,
-                }
-                print(f"[SAVE] saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-                # RAM Cleanup
-                del checkpoint
-                import gc
-                gc.collect()
-                torch.cuda.empty_cache()
+        val_loss = losses['val']
+        print(f"\n[EVAL] step {iter_num}: train loss {losses['train']:.4f}, val loss {val_loss:.4f}")
+        
+        # Skip saving if loss is NaN (training is broken)
+        if math.isnan(val_loss):
+            print(f"[WARN] Skipping checkpoint save - val_loss is NaN!")
+        elif always_save_checkpoint:
+            checkpoint = {
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'model_args': model_args,
+                'iter_num': iter_num,
+                'config': config,
+                'best_val_loss': best_val_loss,
+            }
+            
+            # Always save latest checkpoint
+            print(f"[SAVE] saving checkpoint to {out_dir}")
+            torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+            
+            # Save best checkpoint separately if this is the best
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                checkpoint['best_val_loss'] = best_val_loss
+                print(f"[SAVE] New best! Saving to ckpt_best.pt (val_loss={val_loss:.4f})")
+                torch.save(checkpoint, os.path.join(out_dir, 'ckpt_best.pt'))
+            
+            # RAM Cleanup
+            del checkpoint
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
     
     # 3. Forward / Backward Pass
     channel_loss_type = config.get('channel_loss', None)

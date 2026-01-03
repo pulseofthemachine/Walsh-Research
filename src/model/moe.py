@@ -703,7 +703,9 @@ class HadamardChannelModulation(nn.Module):
         raw_scale, shift = mods.chunk(2, dim=-1)  # [B, n_blocks] each
         
         # Apply tanh to keep scale in reasonable range
-        scale = 1.0 + self.scale_temp * torch.tanh(raw_scale)  # [~0.5, ~1.5]
+        # Clamp scale_temp to prevent explosion (was growing unbounded!)
+        scale_temp = torch.clamp(self.scale_temp, 0.1, 0.5)
+        scale = 1.0 + scale_temp * torch.tanh(raw_scale)  # [0.5, 1.5] range
         
         # Track stats for logging (always, for analysis)
         with torch.no_grad():
